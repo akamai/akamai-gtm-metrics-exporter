@@ -1,0 +1,32 @@
+domains:
+  - domain_name: testdomain.akadns.net    # domain to collect from (list)
+    properties:
+      - property_name: test_property      # property config from which to collect traffic metrics (list)
+        datacenter:
+          - 3131                          # filter on datacenter id (list)
+        dc_nickname: 
+          - test_nickname                 # filter on nickname (list)
+        target_name:
+         - test_target                    # filter on target name (list)
+
+    datacenters:                          
+      - datacenter_id: 3131               # datacenter config from which to collect traffic metrics (list)
+        property:
+          - test_property                 # filter on property (list)
+
+    liveness_tests:
+      - property_name: test_property      # property config frm which to collect liveness test failures
+        agent_ip: 1.2.3.4                 # filter on agent ip
+        target_ip: 4.3.2.1                # filter on target ip
+
+
+edgerc_path: /home/testuser/.edgerc
+
+edgerc_section: default
+
+summary_window: 8h              # # [m]ins, [h]ours, [d]ays
+
+timestamp_label: false          # Creates time series with traffic timestamp as label
+
+traffic_timestamp: false        # Create time series with traffic timestamp
+
