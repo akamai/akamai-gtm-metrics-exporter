@@ -1,4 +1,4 @@
-// Copyright 2020 Akamai Technologies, Inc.
+// Copyright 2021 Akamai Technologies, Inc.
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,10 +14,8 @@
 package collectors
 
 import (
-	//"github.com/prometheus/client_golang/prometheus"
 	"errors"
 	"github.com/prometheus/common/log"
-	//"gopkg.in/yaml.v2"
 )
 
 const (
@@ -114,6 +112,8 @@ type LivenessTestConfig struct {
 	PropertyName string `yaml:"property_name"`
 	AgentIp      string `yaml:"agent_ip,omitempty"`
 	TargetIp     string `yaml:"target_ip,omitempty"`
+	ErrorCode    bool   `yaml:"track_by_errorcode"`
+	Duration     bool   `yaml:"duration_sum"`
 }
 
 // UnmarshalYAML implements the yaml.Unmarshaler interface.
@@ -136,7 +136,8 @@ type GTMMetricsConfig struct {
 	Domains       []*DomainTraffic `yaml:"domains"`
 	EdgercPath    string           `yaml:"edgerc_path"`
 	EdgercSection string           `yaml:"edgerc_section"`
-	SummaryWindow string           `yaml:"summary_window"`    // mins, hours, days, [weeks]. Default lookbackDefaultDays
-	TSLabel       bool             `yaml:"timestamp_label"`   // Creates time series with traffic timestamp as label
-	UseTimestamp  bool             `yaml:"traffic_timestamp"` // Create time series with traffic timestamp
+	SummaryWindow string           `yaml:"summary_window"` // mins, hours, days, [weeks]. Default lookbackDefaultDays
+	PreFillWindow string           `yaml:"prefill_window"`
+	TSLabel       bool             `yaml:"timestamp_label"`             // Creates time series with traffic timestamp as label
+	UseTimestamp  *bool            `yaml:"traffic_timestamp,omitempty"` // Create time series with traffic timestamp
 }

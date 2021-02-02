@@ -24,9 +24,11 @@ edgerc_path: /home/testuser/.edgerc
 
 edgerc_section: default
 
-summary_window: 8h              # # [m]ins, [h]ours, [d]ays
+summary_window: 2d              # # [m]ins, [h]ours, [d]ays. Default: 2d
+
+prefill_window: 1h              # # [m]ins, [h]ours, [d]ays. Default: 10m
 
 timestamp_label: false          # Creates time series with traffic timestamp as label
 
-traffic_timestamp: false        # Create time series with traffic timestamp
+traffic_timestamp: false        # Create time series with traffic timestamp. Default: true
 

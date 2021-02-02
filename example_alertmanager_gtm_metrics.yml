@@ -1,0 +1,23 @@
+# Edge DNS Traffic Example AlertManager Configuration
+# This simple configuration example pairs with the accompanying
+# example_edgedns_traffic_alerts.rules, generating an email alert
+global:
+  resolve_timeout: 5m
+  # The smarthost and SMTP sender used for mail notifications.
+  smtp_smarthost: 'xxxxxx.yyyyyyy.zzz:nnn'
+  smtp_from: 'testuser@test.me'
+  smtp_auth_username: 'testuser'
+  smtp_auth_password: 'abcdefghijk'
+  smtp_require_tls: false
+ 
+route:
+  group_by: [...]
+  group_wait: 10s
+  group_interval: 10s
+  repeat_interval: 1h
+  receiver: test-email
+ 
+receivers:
+- name: test-email
+  email_configs:
+   - to: 'testuser@gmail.com'

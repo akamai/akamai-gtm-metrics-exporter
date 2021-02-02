@@ -1,4 +1,4 @@
-// Copyright 2020 Akamai Technologies, Inc.
+// Copyright 2021 Akamai Technologies, Inc.
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -35,18 +35,16 @@ import (
 )
 
 const (
-	defaultlistenaddress = ":9802"
-	namespace            = "gtm_metrics"
-	//MinsInHour            = 60
-	HoursInDay = 24
-	//DaysInWeek            = 7
-	trafficReportInterval = 5 // mins
-	lookbackDefaultDays   = 1
-	//intervalsPerDay       = (MinsInHour / trafficReportInterval) * HoursInDay
+	defaultlistenaddress    = ":9800"
+	namespace               = "akamai_gtm_"
+	HoursInDay              = 24
+	trafficReportInterval   = 5 // mins
+	lookbackDefaultDuration = 2 * 24 * time.Hour
+	prefillDefaultDuration  = 10 * time.Minute
 )
 
 var (
-	configFile           = kingpin.Flag("config.file", "Edge DNS Traffic exporter configuration file. Default: ./gtm_metrics_config.yml").Default("gtm_metrics_config.yml").String()
+	configFile           = kingpin.Flag("config.file", "GTM Metrics exporter configuration file. Default: ./gtm_metrics_config.yml").Default("gtm_metrics_config.yml").String()
 	listenAddress        = kingpin.Flag("web.listen-address", "The address to listen on for HTTP requests.").Default(defaultlistenaddress).String()
 	edgegridHost         = kingpin.Flag("gtm.edgegrid-host", "The Akamai Edgegrid host auth credential.").String()
 	edgegridClientSecret = kingpin.Flag("gtm.edgegrid-client-secret", "The Akamai Edgegrid client_secret credential.").String()
@@ -54,147 +52,9 @@ var (
 	edgegridAccessToken  = kingpin.Flag("gtm.edgegrid-access-token", "The Akamai Edgegrid access_token credential.").String()
 
 	// invalidMetricChars    = regexp.MustCompile("[^a-zA-Z0-9_:]")
-	lookbackDuration = time.Hour * HoursInDay * lookbackDefaultDays
-	gtmMetricPrefix  = "akamai_gtm_"
-
-	/*
-			defaultLivenessTestConfig = LivenessTestConfig{}
-			defaultTrafficDatacenterConfig = TrafficDatacenterConfig{
-		      						Properties:     make([]string, 0),
-							}
-		      	defaultTrafficPropertyConfig = TrafficPropertyConfig{
-		        					DatacenterIDs:	make([]int, 0),
-		        					DCNicknames:	make([]string, 0),
-		        					Targets:	make([]string, 0),
-							}
-			defaultDomainTraffic = DomainTraffic{
-								Properties:	[]*TrafficPropertyConfig{&defaultTrafficPropertyConfig},
-								Datacenters:	[]*TrafficDatacenterConfig{&defaultTrafficDatacenterConfig},
-								Liveness:	[]*LivenessTestConfig{&defaultLivenessTestConfig},
-							}
-
-			defaultDomainTrafficConfig = DomainTrafficConfig{
-								DomainConfigs: 	[]DomainTraffic{defaultDomainTraffic},
-							}
-			defaultConfig = Config{Domains: defaultDomainTrafficConfig}
-	*/
+	lookbackDuration = lookbackDefaultDuration
+	prefillDuration  = prefillDefaultDuration
 )
-
-/*
-type DomainTraffic struct {
-	Name		string				`yaml:"domain_name"`
-	Properties	[]*TrafficPropertyConfig	`yaml:"properties,omitempty"`
-	Datacenters	[]*TrafficDatacenterConfig	`yaml:"datacenters,omitempty"`
-	Liveness	[]*LivenessTestConfig		`yaml:"liveness_tests,omitempty"`
-}
-
-// UnmarshalYAML implements the yaml.Unmarshaler interface.
-func (c *DomainTraffic) UnmarshalYAML(unmarshal func(interface{}) error) error {
-	*c = defaultDomainTraffic
-	type plain DomainTraffic
-	if err := unmarshal((*plain)(c)); err != nil {
-		return err
-	}
-        log.Debugf("Domain: [%v]", *c)
-	if c.Name == "" {
-		return errors.New("required domain name is empty")
-	}
-	if (c.Properties == nil || len(c.Properties) < 1) && (c.Datacenters == nil || len(c.Datacenters) < 1) && (c.Liveness == nil || len(c.Liveness) < 1) {
-		return errors.New("No property, datacenter or liveness configs to collect")
-	}
-
-	return nil
-}
-
-type TrafficPropertyConfig struct {
-	Name		string		`yaml:"property_name"`
-	DatacenterIDs	[]int		`yaml:"datacenter,omitempty"`
-	DCNicknames	[]string	`yaml:"dc_nickname,omitempty"`
-	Targets		[]string	`yaml:"target_name,omitempty"`
-}
-
-// UnmarshalYAML implements the yaml.Unmarshaler interface.
-func (p *TrafficPropertyConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
-        *p = defaultTrafficPropertyConfig
-        type plain TrafficPropertyConfig
-        if err := unmarshal((*plain)(p)); err != nil {
-                return err
-        }
-        log.Debugf("Property: [%v]", *p)
-        if p.Name == "" {
-                return errors.New("required property name is empty")
-        }
-
-        return nil
-}
-
-type TrafficDatacenterConfig struct {
-      DatacenterID	int		`yaml:"datacenter_id"`	  // Required
-      Properties        []string        `yaml:"property,omitempty"`
-}
-
-// UnmarshalYAML implements the yaml.Unmarshaler interface.
-func (d *TrafficDatacenterConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
-        *d = defaultTrafficDatacenterConfig
-        type plain TrafficDatacenterConfig
-        if err := unmarshal((*plain)(d)); err != nil {
-                return err
-        }
-        log.Debugf("Datacenter: [%v]", *d)
-        if d.DatacenterID == 0 {
-                return errors.New("required datacenter id is not set")
-        }
-
-        return nil
-}
-
-type LivenessTestConfig struct {
-	PropertyName 	string		`yaml:"property_name"`
-	AgentIp		string		`yaml:"agent_ip,omitempty"`
-	TargetIp	string		`yaml:"target_ip,omitempty"`
-}
-
-// UnmarshalYAML implements the yaml.Unmarshaler interface.
-func (p *LivenessTestConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
-        *p = defaultLivenessTestConfig
-        type plain LivenessTestConfig
-        if err := unmarshal((*plain)(p)); err != nil {
-                return err
-        }
-	log.Debugf("Liveness test: [%v]", *p)
-        if p.PropertyName == "" {
-                return errors.New("required property name is empty")
-        }
-
-        return nil
-}
-
-// Exporter config
-type GTMMetricsConfig struct {
-	Domains		[]*DomainTraffic	`yaml:"domains"`
-	EdgercPath    	string  		`yaml:"edgerc_path"`
-	EdgercSection 	string  		`yaml:"edgerc_section"`
-	SummaryWindow 	string  		`yaml:"summary_window"` // mins, hours, days, [weeks]. Default lookbackDefaultDays
-	TSLabel       bool     			`yaml:"timestamp_label"`   // Creates time series with traffic timestamp as label
-	UseTimestamp  bool     			`yaml:"traffic_timestamp"` // Create time series with traffic timestamp
-}
-
-*/
-
-/*
-TODO: Remove?
-type GTMMetricsExporter struct {
-	MetricsExporterConfig 	GTMMetricsConfig
-}
-
-func NewGTMMetricsExporter(gtmMetricsConfig GTMMetricsConfig) *GTMMetricsExporter {
-
-	// FIX
-	return &GTMMetricsExporter{
-		MetricsExporterConfig: gtmMetricsConfig,
-	}
-}
-*/
 
 // Initialize Akamai Edgegrid Config. Priority order:
 // 1. Command line
@@ -210,26 +70,26 @@ func initAkamaiConfig(gtmMetricsConfig collectors.GTMMetricsConfig) error {
 		edgeconf.ClientSecret = *edgegridClientToken
 		edgeconf.AccessToken = *edgegridAccessToken
 		edgeconf.MaxBody = 131072
-		return edgeInit(edgeconf)
+		return collectors.EdgeInit(edgeconf)
 	} else if *edgegridHost != "" || *edgegridClientSecret != "" || *edgegridClientToken != "" || *edgegridAccessToken != "" {
 		log.Warnf("Command line Auth Keys are incomplete. Looking for alternate definitions.")
 	}
 
 	// Edgegrid will also check for environment variables ...
-	err := EdgegridInit(gtmMetricsConfig.EdgercPath, gtmMetricsConfig.EdgercSection)
+	err := collectors.EdgegridInit(gtmMetricsConfig.EdgercPath, gtmMetricsConfig.EdgercSection)
 	if err != nil {
 		log.Fatalf("Error initializing Akamai Edgegrid config: %s", err.Error())
 		return err
 	}
 
-	log.Debugf("Edgegrid config: [%v]", edgegridConfig)
+	log.Debugf("Edgegrid config: [%v]", collectors.EdgegridConfig)
 
 	return nil
 
 }
 
-// Calculate summary window duration based on config and save in lookbackDuration global variable
-func calcSummaryWindowDuration(window string) error {
+// Calculate window duration based on config and save in lookbackDuration global variable
+func calcWindowDuration(window string) (time.Duration, error) {
 
 	var datawin int
 	var err error
@@ -237,7 +97,7 @@ func calcSummaryWindowDuration(window string) error {
 
 	log.Debugf("Window: %s", window)
 	if window == "" {
-		return fmt.Errorf("Summary window not set")
+		return time.Second * 0, fmt.Errorf("Summary window not set")
 	}
 	iunit := window[len(window)-1:]
 	if !strings.Contains("mhd", strings.ToLower(iunit)) {
@@ -257,32 +117,17 @@ func calcSummaryWindowDuration(window string) error {
 	}
 	if err != nil {
 		log.Warnf("ERROR: %s", err.Error())
-		return err
+		return time.Second * 0, err
 	}
 	log.Debugf("multiplier: [%v} units: [%v]", multiplier, datawin)
-	lookbackDuration = multiplier * time.Duration(datawin)
-	return nil
+	return multiplier * time.Duration(datawin), nil
 
 }
-
-/*
-TODO: Remove?
-
-// Describe function
-func (e *GTMMetricsExporter) Describe(ch chan<- *prometheus.Desc) {
-
-	ch <- prometheus.NewDesc(gtmMetricPrefix+"metrics_exporter", "Akamai Global Traffic Management Metrics", nil, nil)
-}
-
-func init() {
-	prometheus.MustRegister(version.NewCollector(gtmMetricPrefix+"metrics_exporter"))
-}
-*/
 
 func main() {
 
 	log.AddFlags(kingpin.CommandLine)
-	kingpin.Version(version.Print(gtmMetricPrefix + "metrics_exporter"))
+	kingpin.Version(version.Print(namespace + "metrics_exporter"))
 	kingpin.HelpFlag.Short('h')
 	kingpin.Parse()
 
@@ -303,43 +148,38 @@ func main() {
 		log.Fatalf("Error initializing Akamai Edgegrid config: %s", err.Error())
 	}
 
-	tstart := time.Now().UTC().Add(time.Minute * time.Duration(trafficReportInterval*-1)) // assume start time is Exporter launch less 5 mins
+	tstart := time.Now().UTC().Add(-1 * prefillDuration) // assume start time is Exporter launch less default prefill
 	if gtmMetricsConfig.SummaryWindow != "" {
-		err = calcSummaryWindowDuration(gtmMetricsConfig.SummaryWindow)
-		if err == nil {
-			tstart = time.Now().UTC().Add(lookbackDuration * -1)
-		} else {
-			log.Warnf("Retention window is not valid. Using default (%d days)", lookbackDefaultDays)
+		lookbackDuration, err = calcWindowDuration(gtmMetricsConfig.SummaryWindow)
+		if err != nil {
+			log.Warnf("Summary Retention window is not valid. Using default")
 		}
 	} else {
-		log.Warnf("Retention window is not configured. Using default (%d days)", lookbackDefaultDays)
+		log.Warnf("Summary Retention window is not configured. Using default")
+	}
+	if gtmMetricsConfig.PreFillWindow != "" {
+		prefillDuration, err = calcWindowDuration(gtmMetricsConfig.PreFillWindow)
+		if err == nil {
+			tstart = time.Now().UTC().Add(prefillDuration * -1)
+		} else {
+			log.Warnf("Prefill window is not valid. Using default")
+		}
+	} else {
+		log.Warnf("Prefill window is not configured. Using default")
 	}
 
 	log.Infof("GTM Metrics exporter start time: %v", tstart)
 
-	/*
-		// TODO:: Follow this pattern?
-		errors := prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "digitalocean_errors_total",
-			Help: "The total number of errors per collector",
-		}, []string{"collector"})
-	*/
+	// Use custom registry
+	r := prometheus.NewRegistry()
+	r.MustRegister(prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
+	r.MustRegister(prometheus.NewGoCollector())
+	r.MustRegister(version.NewCollector(namespace + "metrics_exporter"))
+	r.MustRegister(collectors.NewDatacenterTrafficCollector(r, gtmMetricsConfig, namespace, tstart, lookbackDuration))
+	r.MustRegister(collectors.NewPropertyTrafficCollector(r, gtmMetricsConfig, namespace, tstart, lookbackDuration))
+	r.MustRegister(collectors.NewLivenessTrafficCollector(r, gtmMetricsConfig, namespace, tstart, lookbackDuration))
 
-	// TODO: Option to use custom Registry? ***Clean up***
-
-	//r := prometheus.NewRegistry()
-	prometheus.MustRegister(version.NewCollector(gtmMetricPrefix + "metrics_exporter"))
-	//r.MustRegister(prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
-	//r.MustRegister(prometheus.NewGoCollector())
-	//r.MustRegister(errors)
-	r := &prometheus.Registry{}
-	prometheus.MustRegister(collectors.NewDatacenterTrafficCollector(r, gtmMetricsConfig, gtmMetricPrefix, tstart, lookbackDuration))
-	prometheus.MustRegister(collectors.NewPropertyTrafficCollector(r, gtmMetricsConfig, gtmMetricPrefix, tstart, lookbackDuration))
-	/*
-		        r.MustRegister(NewGTMMetricsExporter(gtmMetricsConfig))
-			r.MustRegister(collectors.NewLivenessTrafficCollector(gtmMetricsConfig, gtmMetricPrefix, tstart))
-	*/
-	http.Handle("/metrics", promhttp.Handler())
+	http.Handle("/metrics", promhttp.HandlerFor(r, promhttp.HandlerOpts{Registry: r}))
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`<html>
 			<head><title>akamai_gtm_metrics_exporter</title></head>
