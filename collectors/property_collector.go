@@ -142,29 +142,29 @@ func (p *GTMPropertyTrafficExporter) Collect(ch chan<- prometheus.Metric) {
 					aggReqs += instanceDC.Requests // aggregate properties in scope
 					if len(prop.DatacenterIDs) > 0 || len(prop.DCNicknames) > 0 || len(prop.Targets) > 0 {
 						// create metric instance for properties in scope
-						var ts_labels []string
+						var tsLabels []string
 						var filterVal string
 						var filterLabel string
 						if intSliceContains(prop.DatacenterIDs, instanceDC.DatacenterId) {
 							filterVal = strconv.Itoa(instanceDC.DatacenterId)
 							filterLabel = "datacenterid"
-							ts_labels = append(baseLabels, filterLabel)
+							tsLabels = append(baseLabels, filterLabel)
 						} else if stringSliceContains(prop.DCNicknames, instanceDC.Nickname) {
 							filterVal = instanceDC.Nickname
 							filterLabel = "nickname"
-							ts_labels = append(baseLabels, filterLabel)
+							tsLabels = append(baseLabels, filterLabel)
 						} else if stringSliceContains(prop.Targets, instanceDC.TrafficTargetName) {
 							filterVal = instanceDC.TrafficTargetName
 							filterLabel = "target"
-							ts_labels = append(baseLabels, filterLabel)
+							tsLabels = append(baseLabels, filterLabel)
 						}
 						if filterVal != "" {
 							// Match!
 							if p.GTMConfig.TSLabel {
-								ts_labels = append(ts_labels, "interval_timestamp")
+								tsLabels = append(tsLabels, "interval_timestamp")
 							}
 							ts := instanceTimestamp.Format(time.RFC3339)
-							desc := prometheus.NewDesc(prometheus.BuildFQName(p.PropertyMetricPrefix, "", "requests_per_interval"), "Number of property requests per 5 minute interval (per domain)", ts_labels, nil)
+							desc := prometheus.NewDesc(prometheus.BuildFQName(p.PropertyMetricPrefix, "", "requests_per_interval"), "Number of property requests per 5 minute interval (per domain)", tsLabels, nil)
 							log.Debugf("Creating Requests metric. Domain: %s, Property: %s, %s: %s, Requests: %v, Timestamp: %v", domain.Name, prop.Name, filterLabel, filterVal, float64(instanceDC.Requests), ts)
 							var reqsmetric prometheus.Metric
 							if p.GTMConfig.TSLabel {
@@ -185,12 +185,12 @@ func (p *GTMPropertyTrafficExporter) Collect(ch chan<- prometheus.Metric) {
 
 				if len(prop.DatacenterIDs) < 1 && len(prop.DCNicknames) < 1 && len(prop.Targets) < 1 {
 					// No filters. Create agg instance
-					ts_labels := baseLabels
+					tsLabels := baseLabels
 					if p.GTMConfig.TSLabel {
-						ts_labels = append(ts_labels, "interval_timestamp")
+						tsLabels = append(tsLabels, "interval_timestamp")
 					}
 					ts := instanceTimestamp.Format(time.RFC3339)
-					desc := prometheus.NewDesc(prometheus.BuildFQName(p.PropertyMetricPrefix, "", "requests_per_interval"), "Number of property requests per 5 minute interval (per domain)", ts_labels, nil)
+					desc := prometheus.NewDesc(prometheus.BuildFQName(p.PropertyMetricPrefix, "", "requests_per_interval"), "Number of property requests per 5 minute interval (per domain)", tsLabels, nil)
 					log.Debugf("Creating Requests metric. Domain: %s, Property: %s, Requests: %v, Timestamp: %v", domain.Name, prop.Name, float64(aggReqs), ts)
 					var reqsmetric prometheus.Metric
 					if p.GTMConfig.TSLabel {

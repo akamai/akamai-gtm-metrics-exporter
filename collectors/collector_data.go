@@ -21,7 +21,6 @@ import (
 const (
 	HoursInDay            = 24
 	trafficReportInterval = 5 // mins
-	lookbackDefaultDays   = 1
 )
 
 var (
@@ -35,9 +34,9 @@ var (
 		Targets:       make([]string, 0),
 	}
 	DefaultDomainTraffic = DomainTraffic{
-		Properties:  []*TrafficPropertyConfig{&defaultTrafficPropertyConfig},
-		Datacenters: []*TrafficDatacenterConfig{&defaultTrafficDatacenterConfig},
-		Liveness:    []*LivenessTestConfig{&defaultLivenessTestConfig},
+		Properties:  make([]*TrafficPropertyConfig,0),
+		Datacenters: make([]*TrafficDatacenterConfig, 0),
+		Liveness:    make([]*LivenessTestConfig, 0),
 	}
 )
 
@@ -110,8 +109,8 @@ func (d *TrafficDatacenterConfig) UnmarshalYAML(unmarshal func(interface{}) erro
 
 type LivenessTestConfig struct {
 	PropertyName string `yaml:"property_name"`
-	AgentIp      string `yaml:"agent_ip,omitempty"`
-	TargetIp     string `yaml:"target_ip,omitempty"`
+	AgentIP      string `yaml:"agent_ip,omitempty"`
+	TargetIP     string `yaml:"target_ip,omitempty"`
 	ErrorCode    bool   `yaml:"track_by_errorcode"`
 	Duration     bool   `yaml:"duration_sum"`
 }

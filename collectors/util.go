@@ -31,9 +31,7 @@ const (
 )
 
 var (
-	// testflag is used for test automation only
-	testflag bool = false
-	// edgegridConfig contains the Akamai OPEN Edgegrid API credentials for automatic signing of requests
+	// EdgegridConfig contains the Akamai OPEN Edgegrid API credentials for automatic signing of requests
 	EdgegridConfig edgegrid.Config = edgegrid.Config{}
 	// testflag is used for test automation only
 )
@@ -64,13 +62,13 @@ type GTMReportQueryArgs struct {
 	End      string `json:"end"`   // YYYY-MM-DDThh:mm:ssZ in UTC
 	Start    string `json:"start"` // YYYY-MM-DDThh:mm:ssZ in UTC
 	Date     string `json:"date"`  // YYYY-MM-DD format
-	AgentIp  string `json:"agentIp"`
-	TargetIp string `json:"targetIp"`
+	AgentIP  string `json:"agentIp"`
+	TargetIP string `json:"targetIp"`
 }
 
 // Liveness Errors Report Structs
 type LivenessTMeta struct {
-	Uri      string `json:uri"`
+	URI      string
 	Domain   string `json:"domain"`
 	Property string `json:"property"`
 	Date     string `json:"date"`
@@ -78,13 +76,13 @@ type LivenessTMeta struct {
 
 type LivenessDRow struct {
 	Nickname          string `json:"nickname"`
-	DatacenterId      int    `json:"datacenterId"`
+	DatacenterID      int    `json:"datacenterId"`
 	TrafficTargetName string `json:"trafficTargetName"`
 	ErrorCode         int64  `json:"errorCode"`
 	Duration          int64  `json:"duration"`
 	TestName          string `json:"testName"`
-	AgentIp           string `json:"agentIp"`
-	TargetIp          string `json:"targetIp"`
+	AgentIP           string `json:"agentIp"`
+	TargetIP          string `json:"targetIp"`
 }
 
 type LivenessTData struct {

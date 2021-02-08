@@ -125,7 +125,7 @@ func (l *GTMLivenessTrafficExporter) Collect(ch chan<- prometheus.Metric) {
 			// get last timestamp recorded. make sure diff > 5 mins.
 			lasttime := l.LastTimestamp[domain.Name][prop.PropertyName].Add(time.Minute)
 			log.Debugf("Fetching liveness errors Report for property %s in domain %s.", prop.PropertyName, domain.Name)
-			livenessTrafficReport, err := retrieveLivenessTraffic(domain.Name, prop.PropertyName, prop.AgentIp, prop.TargetIp, lasttime)
+			livenessTrafficReport, err := retrieveLivenessTraffic(domain.Name, prop.PropertyName, prop.AgentIP, prop.TargetIP, lasttime)
 			if err != nil {
 				apierr, ok := err.(client.APIError)
 				if ok && apierr.Status == 500 {
@@ -139,7 +139,7 @@ func (l *GTMLivenessTrafficExporter) Collect(ch chan<- prometheus.Metric) {
 				// We've probably crossed a day boundary. Bump last time
 				lasttime = lasttime.Add(23*time.Hour + 59*time.Minute + 59*time.Second)
 				// get updated report
-				livenessTrafficReport, err = retrieveLivenessTraffic(domain.Name, prop.PropertyName, prop.AgentIp, prop.TargetIp, lasttime)
+				livenessTrafficReport, err = retrieveLivenessTraffic(domain.Name, prop.PropertyName, prop.AgentIP, prop.TargetIP, lasttime)
 				if err != nil {
 					apierr, ok := err.(client.APIError)
 					if ok && apierr.Status == 500 {
@@ -174,30 +174,30 @@ func (l *GTMLivenessTrafficExporter) Collect(ch chan<- prometheus.Metric) {
 				var baseLabels = []string{"domain", "property", "datacenter"}
 				for _, instanceDC := range reportInstance.Datacenters {
 					// create metrics for datacenters in property per timestamp
-					var ts_labels = baseLabels
-					labelVals := []string{domain.Name, prop.PropertyName, strconv.Itoa(instanceDC.DatacenterId)}
+					var tsLabels = baseLabels
+					labelVals := []string{domain.Name, prop.PropertyName, strconv.Itoa(instanceDC.DatacenterID)}
 
-					if prop.AgentIp == instanceDC.AgentIp {
-						ts_labels = append(ts_labels, "agentip")
-						labelVals = append(labelVals, instanceDC.AgentIp)
+					if prop.AgentIP == instanceDC.AgentIP {
+						tsLabels = append(tsLabels, "agentip")
+						labelVals = append(labelVals, instanceDC.AgentIP)
 					}
-					if prop.TargetIp == instanceDC.TargetIp {
-						ts_labels = append(ts_labels, "targetip")
-						labelVals = append(labelVals, instanceDC.TargetIp)
+					if prop.TargetIP == instanceDC.TargetIP {
+						tsLabels = append(tsLabels, "targetip")
+						labelVals = append(labelVals, instanceDC.TargetIP)
 					}
 					if prop.ErrorCode {
-						ts_labels = append(ts_labels, "errorcode")
+						tsLabels = append(tsLabels, "errorcode")
 						codestring := fmt.Sprintf("%v", instanceDC.ErrorCode)
 						labelVals = append(labelVals, codestring)
 					}
 					ts := instanceTimestamp.Format(time.RFC3339)
 					if l.GTMConfig.TSLabel {
-						ts_labels = append(ts_labels, "interval_timestamp")
+						tsLabels = append(tsLabels, "interval_timestamp")
 						labelVals = append(labelVals, ts)
 					}
-					desc := prometheus.NewDesc(prometheus.BuildFQName(l.LivenessMetricPrefix, "", "datacenter_failures"), "Number of datacenter failures (per domain, property, datacenter)", ts_labels, nil)
-					log.Debugf("Creating error failures counter metric. Domain: %s, Property: %s, Datacenter: %d, Timestamp: %v", domain.Name, prop.PropertyName, instanceDC.DatacenterId, ts)
-					var errorsmetric prometheus.Metric
+					desc := prometheus.NewDesc(prometheus.BuildFQName(l.LivenessMetricPrefix, "", "datacenter_failures"), "Number of datacenter failures (per domain, property, datacenter)", tsLabels, nil)
+					log.Debugf("Creating error failures counter metric. Domain: %s, Property: %s, Datacenter: %d, Timestamp: %v", domain.Name, prop.PropertyName, instanceDC.DatacenterID, ts)
+					var errorsmetric, durmetric prometheus.Metric
 					errorsmetric = prometheus.MustNewConstMetric(
 						desc, prometheus.CounterValue, 1, labelVals...)
 					if l.GTMConfig.UseTimestamp != nil && !*l.GTMConfig.UseTimestamp {
@@ -205,9 +205,8 @@ func (l *GTMLivenessTrafficExporter) Collect(ch chan<- prometheus.Metric) {
 					} else {
 						ch <- prometheus.NewMetricWithTimestamp(instanceTimestamp, errorsmetric)
 					}
-					desc = prometheus.NewDesc(prometheus.BuildFQName(l.LivenessMetricPrefix, "", "datacenter_failure_duration"), "Datacenter falure duration (per domain, property, datacenter)", ts_labels, nil)
-					log.Debugf("Creating failure duration gauge metric. Domain: %s, Property: %s, Datacenter: %d, Timestamp: %v", domain.Name, prop.PropertyName, instanceDC.DatacenterId, ts)
-					var durmetric prometheus.Metric
+					desc = prometheus.NewDesc(prometheus.BuildFQName(l.LivenessMetricPrefix, "", "datacenter_failure_duration"), "Datacenter falure duration (per domain, property, datacenter)", tsLabels, nil)
+					log.Debugf("Creating failure duration gauge metric. Domain: %s, Property: %s, Datacenter: %d, Timestamp: %v", domain.Name, prop.PropertyName, instanceDC.DatacenterID, ts)
 					durmetric = prometheus.MustNewConstMetric(
 						desc, prometheus.GaugeValue, float64(instanceDC.Duration), labelVals...)
 					if l.GTMConfig.UseTimestamp != nil && !*l.GTMConfig.UseTimestamp {
@@ -215,7 +214,7 @@ func (l *GTMLivenessTrafficExporter) Collect(ch chan<- prometheus.Metric) {
 					} else {
 						ch <- prometheus.NewMetricWithTimestamp(instanceTimestamp, durmetric)
 					}
-					maps := l.getDatacenterHistogramMetrics(domain.Name, prop.PropertyName, instanceDC.DatacenterId)
+					maps := l.getDatacenterHistogramMetrics(domain.Name, prop.PropertyName, instanceDC.DatacenterID)
 					maps["duration"].(prometheus.Histogram).Observe(float64(instanceDC.Duration))
 					maps["errors"].(prometheus.Summary).Observe(float64(1))
 
@@ -233,17 +232,17 @@ func (l *GTMLivenessTrafficExporter) Collect(ch chan<- prometheus.Metric) {
 	} // domain end
 }
 
-func retrieveLivenessTraffic(domain, prop, agentId, targetId string, start time.Time) (*LivenessErrorsResponse, error) {
+func retrieveLivenessTraffic(domain, prop, agentID, targetID string, start time.Time) (*LivenessErrorsResponse, error) {
 
 	qargs := make(map[string]string)
-	if len(targetId) > 0 {
-		qargs["targetId"] = targetId // Takes priority
+	if len(targetID) > 0 {
+		qargs["targetId"] = targetID // Takes priority
 	}
-	if len(agentId) > 0 {
-		if len(targetId) > 0 {
+	if len(agentID) > 0 {
+		if len(targetID) > 0 {
 			log.Warnf("Both agentId and targetId filters set. Using targetId ONLY")
 		} else {
-			qargs["agentId"] = agentId
+			qargs["agentId"] = agentID
 		}
 	}
 
@@ -278,14 +277,14 @@ func retrieveLivenessTraffic(domain, prop, agentId, targetId string, start time.
 			Property: "www",
 			Uri:      "https://akab-xxxxxxxxxxxxxxxx-xxxxxxxxxxxxxxxx.luna.akamaiapis.net/gtm-api/v1/reports/liveness-tests/domains/example.akadns.net/properties/www?date=2016-11-23"}
 		dcptr := &LivenessDRow{
-			DatacenterId:      3201,
-			AgentIp:           "204.1.136.239",
+			DatacenterID:      3201,
+			AgentIP:           "204.1.136.239",
 			TestName:          "Our defences",
 			ErrorCode:         3101,
 			Duration:          0,
 			Nickname:          "Winterfell",
 			TrafficTargetName: "Winterfell - 1.2.3.4",
-			TargetIp:          "1.2.3.4"}
+			TargetIP:          "1.2.3.4"}
 		ldrows := []*LivenessDRow{dcptr}
 		ldrowptr := &LivenessTData{Timestamp: time.Now().UTC().Add(-10*time.Minute).Format(time.RFC3339), Datacenters: ldrows}
 		resp = &LivenessErrorsResponse{

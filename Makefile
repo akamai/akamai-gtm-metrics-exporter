@@ -62,7 +62,9 @@ $(eval $(call goarch_pair,amd64,386))
 $(eval $(call goarch_pair,mips64,mips))
 $(eval $(call goarch_pair,mips64el,mipsel))
 
-all:: common-all
+.PHONY: all
+all:: precheck style check_license lint build
+
 
 .PHONY: promtool
 promtool: $(PROMTOOL)

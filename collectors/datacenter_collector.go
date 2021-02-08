@@ -145,12 +145,12 @@ func (d *GTMDatacenterTrafficExporter) Collect(ch chan<- prometheus.Metric) {
 					if len(dc.Properties) > 0 {
 						// create metric instance for properties in scope
 						if stringSliceContains(dc.Properties, instanceProp.Name) {
-							ts_labels := append(baseLabels, "property")
+							tsLabels := append(baseLabels, "property")
 							if d.GTMConfig.TSLabel {
-								ts_labels = append(ts_labels, "interval_timestamp")
+								tsLabels = append(tsLabels, "interval_timestamp")
 							}
 							ts := instanceTimestamp.Format(time.RFC3339)
-							desc := prometheus.NewDesc(prometheus.BuildFQName(d.DCMetricPrefix, "", "requests_per_interval"), "Number of datacenter requests per 5 minute interval (per domain)", ts_labels, nil)
+							desc := prometheus.NewDesc(prometheus.BuildFQName(d.DCMetricPrefix, "", "requests_per_interval"), "Number of datacenter requests per 5 minute interval (per domain)", tsLabels, nil)
 							log.Debugf("Creating Requests metric. Domain: %s, Datacenter: %d, Property: %s, Requests: %v, Timestamp: %v", domain.Name, dc.DatacenterID, instanceProp.Name, float64(instanceProp.Requests), ts)
 							var reqsmetric prometheus.Metric
 							if d.GTMConfig.TSLabel {
@@ -170,12 +170,12 @@ func (d *GTMDatacenterTrafficExporter) Collect(ch chan<- prometheus.Metric) {
 				} // properties in time interval end
 				if len(dc.Properties) < 1 {
 					// Create agg instance
-					ts_labels := baseLabels
+					tsLabels := baseLabels
 					if d.GTMConfig.TSLabel {
-						ts_labels = append(ts_labels, "interval_timestamp")
+						tsLabels = append(tsLabels, "interval_timestamp")
 					}
 					ts := instanceTimestamp.Format(time.RFC3339)
-					desc := prometheus.NewDesc(prometheus.BuildFQName(d.DCMetricPrefix, "", "requests_per_interval"), "Number of datacenter requests per 5 minute interval (per domain)", ts_labels, nil)
+					desc := prometheus.NewDesc(prometheus.BuildFQName(d.DCMetricPrefix, "", "requests_per_interval"), "Number of datacenter requests per 5 minute interval (per domain)", tsLabels, nil)
 					log.Debugf("Creating Requests metric. Domain: %s, Datacenter: %d, Requests: %v, Timestamp: %v", domain.Name, dc.DatacenterID, float64(aggReqs), ts)
 					var reqsmetric prometheus.Metric
 					if d.GTMConfig.TSLabel {
