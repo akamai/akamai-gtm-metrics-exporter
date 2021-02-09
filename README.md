@@ -1,6 +1,6 @@
 # akamai-gtm-metrics-exporter
 
-This technical preview of the Prometheus Akamai Global Traffic Management (GTM) Metrics Exporter publishes Akamai GTM [Traffic and Liveness Report](https://developer.akamai.com/api/web_performance/global_traffic_management_reporting/v1.html) data as `up` metrics. With GTM metrics, Prometheus can track GTM property and datacenter request traffic, as well as property liveness errorsr. Alerts can also be triggered utilizing generated metrics; e.g. Domain datacenter requests exceeding a threshhold or the number of liveness test failures for a property exceeding a threshhold.
+This technical preview of the Prometheus Akamai Global Traffic Management (GTM) Metrics Exporter publishes Akamai GTM [Traffic and Liveness Report](https://developer.akamai.com/api/web_performance/global_traffic_management_reporting/v1.html) data as `up` metrics. With GTM metrics, Prometheus can track GTM property and datacenter request traffic, as well as property liveness errors. Alerts can also be triggered utilizing generated metrics; e.g. Domain datacenter requests exceeding a threshhold or the number of liveness test failures for a property exceeding a threshhold.
 
 ## Getting Started
 
@@ -10,9 +10,9 @@ This technical preview of the Prometheus Akamai Global Traffic Management (GTM) 
 
 ## Prerequisites
 
-* Prometheus environment
+* Prometheus environment.
 * [Go environment](https://golang.org/doc/install).
-* Valid API client with authoritation to use the Global Traffic Management Reporting API. [Akamai API Authentication](https://developer.akamai.com/getting-started/edgegrid) provides an overview and further information pertaining to the generation of auth credentials for API based applications and tools.
+* Valid API client with authorization to use the Global Traffic Management Reporting API. [Akamai API Authentication](https://developer.akamai.com/getting-started/edgegrid) provides an overview and further information pertaining to the generation of authorization credentials for API based applications and tools.
 
 ## Install
 
@@ -46,7 +46,7 @@ make test
 
 The exporter requires Akamai Open Edgegrid credentials to configure the GTM API connection and can get credentials from:
 
-1. An .edgerc file and section set with the exporter configuration file.
+1. An `.edgerc` file and section set with the exporter configuration file.
 2. Environment variables.
 3. Command line arguments.
 
