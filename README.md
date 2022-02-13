@@ -1,6 +1,6 @@
 # akamai-gtm-metrics-exporter
 
-This technical preview of the Prometheus Akamai Global Traffic Management (GTM) Metrics Exporter publishes Akamai GTM [Traffic and Liveness Report](https://developer.akamai.com/api/web_performance/global_traffic_management_reporting/v1.html) data as `up` metrics. With GTM metrics, Prometheus can track GTM property and datacenter request traffic, as well as property liveness errors. Alerts can also be triggered utilizing generated metrics; e.g. Domain datacenter requests exceeding a threshhold or the number of liveness test failures for a property exceeding a threshhold.
+This technical preview of the Prometheus Akamai Global Traffic Management (GTM) Metrics Exporter publishes Akamai GTM [Traffic and Liveness Report](https://developer.akamai.com/api/web_performance/global_traffic_management_reporting/v1.html) data as `up` metrics. With GTM metrics, Prometheus can track GTM property and datacenter request traffic, as well as property liveness errors. Alerts can also be triggered utilizing generated metrics; e.g., Domain datacenter requests exceeding a threshhold or the number of liveness test failures for a property exceeding a threshhold.
 
 ## Getting Started
 
@@ -12,7 +12,7 @@ This technical preview of the Prometheus Akamai Global Traffic Management (GTM) 
 
 * Prometheus environment.
 * [Go environment](https://golang.org/doc/install).
-* Valid API client with authorization to use the Global Traffic Management Reporting API. [Akamai API Authentication](https://developer.akamai.com/getting-started/edgegrid) provides an overview and further information pertaining to the generation of authorization credentials for API based applications and tools.
+* Valid API client with authorization to use the Global Traffic Management Reporting API. [Akamai API Authentication](https://techdocs.akamai.com/developer/docs/set-up-authentication-credentials) provides an overview and further information pertaining to the generation of authorization credentials for API based applications and tools.
 
 ## Install
 
@@ -67,7 +67,7 @@ traffic_timestamp | (Optional) Flag indicates if time series should be created w
 
 ### Environment variables 
 
-Authentication credentials as environment variables can exist as follows:
+Authentication credentials as environment variables can exist as follows.
 
 | Environment Variable | Description |
 | -------------------- | ----------- |
@@ -78,7 +78,7 @@ Authentication credentials as environment variables can exist as follows:
 
 ### Target settings
 
-Prometheus target configuration is minimal. As the following fragment shows, settings for a static configuration for a target pointing to the GTM exporter, the scrape interval and the scrape timeout.
+Prometheus target configuration is minimal. The following fragment shows settings for a static configuration for a target pointing to the GTM exporter, the scrape interval and the scrape timeout.
 
 ```
 global:
@@ -95,7 +95,7 @@ scrape_configs:
 ## Run the binary
 
 ```bash
-./akamai-gtm-metrics-exporter
+./akamai-gtm-metrics-traffic-exporter
 ```
 
 In the log, the exporter will publish a series of INFO messages to show normal operation. Look for the `Beginning to serve on address:` message to learn its port.
@@ -122,7 +122,7 @@ akamai_gtm_metrics_exporter_build_info{branch="master",goversion="go1.15.6",revi
 Use -h or --help flag to list available options.
 
 ```
-./akamai-gtm-metrics-exporter --help
+./akamai-gtm-metrics-traffic-exporter --help
 usage: akamai-gtm-metrics-exporter [<flags>]
 
 Flags:
@@ -152,13 +152,13 @@ Note: By default, the exporter expects the configuration file to exist in the cu
 `Invoke exporter with a configuration file path`
 
 ```bash
-./akamai-gtm-metrics-exporter --config.file=gtm_metrics_example_config.yml
+./akamai-gtm-metrics-traffic-exporter --config.file=gtm_metrics_example_config.yml
 ```
 
 `Invoke exporter with a configuration file path and Edgegrid authentication credentials`
 
 ```bash
-./akamai-gtm-metrics-exporter --config.file=gtm_metrics_example_config.yml --edgedns.edgegrid-host akab-abcdefghijklmnop-01234567890aaaaa.luna.akamaiapis.net --edgedns.edgegrid-access-token example_provided_access_token --edgedns.edgegrid-client-token example_provided_client_token --edgedns.edgegrid-client-secret example_provided_client_secret
+./akamai-gtm-metrics-traffic-exporter --config.file=gtm_metrics_example_config.yml --edgedns.edgegrid-host akab-abcdefghijklmnop-01234567890aaaaa.luna.akamaiapis.net --edgedns.edgegrid-access-token example_provided_access_token --edgedns.edgegrid-client-token example_provided_client_token --edgedns.edgegrid-client-secret example_provided_client_secret
 ```
 
 ## Collectors
@@ -217,7 +217,7 @@ domains:
          - test_target                    # filter on target name (list)
 ```
 
-This example configuration instructs the collector to retrieve property requests activity from `property_name` `test_property`. The property requests can be further filtered by `datacenter`, `dc_nickname` or `target_name`. Only the first in priority order will be used. Thus, in the example above, datacenter with id 3131 is used. To retrieve requests activity for the property across all its datacenteris, omit the filter keys.
+This example configuration instructs the collector to retrieve property requests activity from `property_name` `test_property`. The property requests can be further filtered by `datacenter`, `dc_nickname` or `target_name`. Only the first in priority order will be used. Thus, in the example above, datacenter with id 3131 is used. To retrieve requests activity for the property across all its datacenters, omit the filter keys.
 
 #### Metrics
 
