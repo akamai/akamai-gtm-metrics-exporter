@@ -59,7 +59,7 @@ Configuration element | Description
 --------------------- | -----------
 domains | (Required) Akamai GTM domains to collect traffic metrics from
 edgerc_path | (Optional) Accessible path to Edgegrid credentials file, e.g /home/test/.edgerc
-edgerc_section | (Optional) Section in the Edgegrid credentials file containing credentials
+edgerc_section | (Optional) Section in the Edgegrid credentials file containing credentials, note: remember to include the edgerc_section if specifying an edgerc_path
 summary_window | (Optional) Rolling window for summary metric data in [m]ins, [h]ours, or [d]ays. Default: 2 days (2d)
 prefill_window | (Optional) Prefill window for Report data retrieval in [m]ins, [h]ours, or [d]ays. Default: 10 minutes (10m)
 timestamp_label | (Optional) Flag indicates if time series should be created with traffic timestamp as label
