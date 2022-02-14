@@ -66,8 +66,8 @@ func initAkamaiConfig(gtmMetricsConfig collectors.GTMMetricsConfig) error {
 	if *edgegridHost != "" && *edgegridClientSecret != "" && *edgegridClientToken != "" && *edgegridAccessToken != "" {
 		edgeconf := edgegrid.Config{}
 		edgeconf.Host = *edgegridHost
-		edgeconf.ClientToken = *edgegridClientSecret
-		edgeconf.ClientSecret = *edgegridClientToken
+		edgeconf.ClientToken = *edgegridClientToken
+		edgeconf.ClientSecret = *edgegridClientSecret
 		edgeconf.AccessToken = *edgegridAccessToken
 		edgeconf.MaxBody = 131072
 		return collectors.EdgeInit(edgeconf)
