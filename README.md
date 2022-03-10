@@ -60,8 +60,8 @@ Configuration element | Description
 domains | (Required) Akamai GTM domains to collect traffic metrics from
 edgerc_path | (Optional) Accessible path to Edgegrid credentials file, e.g /home/test/.edgerc
 edgerc_section | (Optional) Section in the Edgegrid credentials file containing credentials, note: remember to include the edgerc_section if specifying an edgerc_path
-summary_window | (Optional) Rolling window for summary metric data in [m]ins, [h]ours, or [d]ays. Default: 2 days (2d)
-prefill_window | (Optional) Prefill window for Report data retrieval in [m]ins, [h]ours, or [d]ays. Default: 10 minutes (10m)
+summary_window | (Optional) Rolling window for relevant metric data such as quantiles in [m]ins, [h]ours, or [d]ays. Default: 2 days (2d)
+prefill_window | (Optional) Prefill window for report data retrieval in [m]ins, [h]ours, or [d]ays. Default: 10 minutes (10m)
 timestamp_label | (Optional) Flag indicates if time series should be created with traffic timestamp as label
 traffic_timestamp | (Optional) Flag indicates if time series should be created with the traffic timestamp
 
@@ -91,6 +91,7 @@ scrape_configs:
     static_configs:
       - targets: ['docker.for.mac.localhost:9800']
 ```
+Note: targets point to GTM Exporters.
 
 ## Run the binary
 
@@ -109,7 +110,7 @@ INFO[0000] GTM Metrics exporter start time: 2021-01-27 15:53:27.062040712 +0000 
 INFO[0000] Beginning to serve on address :9800           source="main.go:231"
 ```
 
-NOTE: running the exporter without the appropriate settings to access the GTM Traffic Reporting API will only publish build info like below. To validate, visit the exporter's metrics view with a browser using local host and the exporter's port known from one of the INFO startup messages (e.g., http://localhost:9800/metrics).
+Note: running the exporter without the appropriate settings to access the GTM Traffic Reporting API will only publish build info like below. To validate, visit the exporter's metrics view with a browser using local host and the exporter's port known from one of the INFO startup messages (e.g., http://localhost:9800/metrics).
 
 ```
 # HELP akamai_gtm_metrics_exporter_build_info A metric with a constant '1' value labeled by version, revision, branch, and goversion from which akamai_gtm_metrics_exporter was built.
@@ -177,12 +178,12 @@ An example configuration snippet for the datacenter collector is:
 domains:
   - domain_name: testdomain.akadns.net    # domain to collect from (list)
     datacenters:
-      - datacenter_id: 3131               # datacenter config from which to collect traffic metrics (list)
+      - datacenter_id: 3131               # datacenter config to collect traffic metrics (list)
         property:
           - test_property                 # filter on property (list)
 ```
 
-This exmple configuration instructs the collector to retrieve datacenter request activity from `datacenter_id: 3131` and `property` `test_property`. In order to retrieve activity for the entire datacenter, omit the `property` key.
+This example configuration instructs the collector to retrieve datacenter request activity from `datacenter_id: 3131` and `property` `test_property`. In order to retrieve activity for the entire datacenter, omit the `property` key.
 
 #### Metrics
 
@@ -195,6 +196,8 @@ akamai_gtm_datacenter_traffic_requests_per_interval_summary_sum | Summary aggreg
 akamai_gtm_datacenter_traffic_requests_per_interval_summary_count | Summary count of datacenter requests per 5 minute interval (per domain)
 
 The base labels used for datacenter metrics are domain and datacenter. A property label will be added if a property filter is specified. A timestamp filter will also be added if configured for the exporter.
+
+Note: The _sum and _count metrics are cumulative since start time.
 
 ### Property traffic
 
@@ -230,6 +233,8 @@ akamai_gtm_property_traffic_requests_per_interval_summary_sum | Summary aggregat
 akamai_gtm_property_traffic_requests_per_interval_summary_count | Summary count of property requests per 5 minute interval (per domain)
 
 The base labels used for property metrics are domain and property. An additional label (datacenterid, nickname or target) will be added if a property filter is specified. A timestamp filter will also be added if configured for the exporter.
+
+Note: The _sum and _count metrics are cumulative since start time.
 
 ### Liveness errors
 
@@ -268,11 +273,13 @@ The histogram duration buckets (in seconds) are: 60, 1800, 3600, 7200, and 14400
  
 The base labels used for liveness metrics are domain, property and datacenter. An additional label (targetip or agentip) will be added if a property filter is specified. A timestamp filter will also be added if configured for the exporter.
 
+Note: The _sum and _count metrics are cumulative since start time.
+
 ## Metrics operation
 
 ### View the metrics from the exporter's webserver
 
-To glimpse at the reported GTM metric activity in the exporter, visit the exporter's metrics web page with a browser using local host and the exporter's port known from one of the INFO startup messages (e.g., http://localhost:9800/metrics). The following snippet shows example console output with all three collectors configured.
+To glimpse at GTM metric activity in the exporter, visit the exporter's metrics web page with a browser using local host and the exporter's port known from one of the INFO startup messages (e.g., http://localhost:9800/metrics). The following snippet shows example console output with all three collectors configured.
 
 ```
 # HELP akamai_gtm_datacenter_traffic_requests_per_interval Number of datacenter requests per 5 minute interval (per domain)
@@ -320,6 +327,10 @@ To view the metrics in Prometheus, visit Graph and Execute an expression for one
 
 ![Prometheus](/static/datacenter-interval-summary.png)
 
+As another example, the following expression will render an average rate of datacenter traffic for the last 30 minutes.
+
+`avg_over_time(akamai_gtm_datacenter_traffic_requests_per_interval[30m])`
+
 ### Advanced operation
 
 Prometheus' default TLDB storage bounds the timestamp window that it will accept for newly created time series metrics (~2-3 hours past to current). Given that the GTM API works in its own timecycle with sometimes no data for a given interval, advanced configuration options exist with defaults.
@@ -332,13 +343,13 @@ Changing the advanced configuration defaults, though, comes with associated Prom
 
 #### `timestamp_label` behavior notes
 
-Adding a timestamp label maybe helpful in knowing the actual time and day that the event. Adding a timestamp label to each metric time series has the side effect of creating a distinct series for each label/timestamp combination. When retreiving metrics, it is recommended to use only the desired labels in the query expression. The legend displayed when viewing graphs through the Prometheus portal will contain all generated series; hundreds per day. Other viewing applications, e.g. Grafana, will allow graph customization and reduced screen clutter. 
+Adding a timestamp label maybe helpful in knowing the actual time and day that the event. Adding a timestamp label to each metric time series has the side effect of creating a distinct series for each label/timestamp combination. When retrieving metrics, it is recommended to use only the desired labels in the query expression. The legend displayed when viewing graphs through the Prometheus portal will contain all generated series; hundreds per day. Other viewing applications, e.g. Grafana, will allow graph customization and reduced screen clutter. 
 
 The table tab in the Prometheus portal may provide a more manageable means to view metrics with a timestamp label. For example by only retrieving the last five (5) minutes of collected metrics; e.g. `akamai_gtm_datacenter_traffic_requests_per_interval{datacenter="3131",domain="testdomain.akadns.net",property="testprop"}[5m]`.
 
 #### `summary_window` behavior Notes
 
-The `summary_window` configuration informs the collector as to how much data to include when calculating requests summary count and sum. It is a rolling window, aggregating the most recent metric data.
+The `summary_window` configuration informs the collector as to how much data to include when calculating requests for relevant metrics such as quantiles.
 
 #### `traffic_timestamp` behavior notes
 
@@ -352,13 +363,13 @@ and continue to collect future metric data. The dropped data will not be availab
 
 #### `prefill_window` behavior notes
 
-The `prefill_window` informs the collector as to how far to reach back in time and incorporate historical report data in Prometheus. This "priming" of the TSDB will provide a headstart to view and analyze meric trends.
+The `prefill_window` informs the collector as to how far to reach back in time and incorporate historical report data in Prometheus. This "priming" of the TSDB will provide a headstart to view and analyze metric trends.
 
 A side effect of configuring the `prefill_window` to be greater than the current time series open window, combined with enabling metric creation with timestamps, is that the Prometheus server will reject any metrics timestamped outside the current time series window. Aside from not creating the metrics, the log will also be cluttered with warnings to this effect.
 
 ## Post processing metrics
 
-Post processing of collected metrics may be designed in order to perform additional analysis of collected traffic data or to detect abnormalities in the collected data. Post processing is done on the Prometheus server. The rules executed to accomplish this post processing are specified in the Prometheus server configuration file in the rules-files section. An example rules definition file, [example_gtm_metrics_alerts.rules](https://github.com/akamai/akamai-gtm-metrics-exporter/blob/master/example_gtm_metrics_alerts.rules), defines recording rules to prepare for excessive datacenter requests detection in an interval and detection of datacenter failure durations greater than 30 minutes. Snippets of the example rules file configuration that define additional metrics and the expressions to produce the metrics:
+Post processing of collected metrics may be designed in order to perform additional analysis of collected traffic data or detect abnormalities in the collected data. Post processing is done on the Prometheus server. The rules executed to accomplish this post processing are specified in the Prometheus server configuration file in the rules-files section. An example rules definition file, [example_gtm_metrics_alerts.rules](https://github.com/akamai/akamai-gtm-metrics-exporter/blob/master/example_gtm_metrics_alerts.rules), defines recording rules to prepare for excessive datacenter requests detection in an interval and detection of datacenter failure durations greater than 30 minutes. Snippets of the example rules file configuration that define additional metrics and the expressions to produce the metrics:
 
 ```
   - name: gtm_datacenter_requests_over_example
@@ -379,7 +390,7 @@ Post processing of collected metrics may be designed in order to perform additio
         expr: scalar(akamai_gtm_property_liveness_errors_duration_per_datacenter_histogram_bucket{domain="test.domain.akadns.net", property="testprop",datacenter="3131",le="3600"}) - scalar(akamai_gtm_property_liveness_errors_duration_per_datacenter_histogram_bucket{domain="test.domain.akadns.net", property="testprop",datacenter="3131",le="1800"})
 ```
 
-The first snippet identifies the largest number of datacenter requests in the five minutes, calculates the current average requests interval rate, and compares the high interval with a threshhold set as the average times 2. In this way, Prometheus records events of requests spikes indicating excessive datacenter load.
+The first snippet identifies the largest number of datacenter requests in the five minutes, calculates the current average requests interval rate, and compares the high interval with a threshhold set as the average times 2. In this way, Prometheus records events of request spikes indicating excessive datacenter load.
 
 The second snippet identifies the number of test failures with a duration between 30 minutes (1800 secs) and one hour (3600 seconds). Prometheus records the number of these failures, potentially indicating excessive datacenter down time.
 
@@ -387,9 +398,9 @@ These newly generated metrics can be viewed on a graph or built upon, as in the 
 
 ## Alerting on metrics
 
-To detect and alert on an event or abnormality, two actions must be taken. First, an alert rule must be defined that will detect the activity of interest and generate the alert. The rules example defined in [example_gtm_metrics_alerts.rules](https://github.com/akamai/akamai-gtm-metrics-exporter/blob/master/example_gtm_metrics_alerts.rules) provide two examples of the first these to steps.
+To detect and alert on an event or abnormality, two actions must be taken. First, an alert rule must be defined that will detect the activity of interest and generate the alert. The rules example defined in [example_gtm_metrics_alerts.rules](https://github.com/akamai/akamai-gtm-metrics-exporter/blob/master/example_gtm_metrics_alerts.rules) provides first steps to define alerts and configure the alert manager.
 
-Two snippets from the rules file present alert rules that check whether the number of interval datacenter requests exceeds a threshhold and if any test durations exceeds 30 minutes.
+Two snippets from the rules file present alert rules that check whether the number of interval datacenter requests exceeds a threshhold and if any test durations exceeds 30 minutes:
 
 ```
       - alert: DatacenterRequestsOutOfBounds
