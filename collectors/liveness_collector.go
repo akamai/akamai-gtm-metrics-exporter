@@ -30,8 +30,9 @@ var durationBuckets = []float64{60, 1800, 3600, 7200, 14400}
 
 const (
 	livenessCollectorName = "liveness"
-	// Bounds the days walked in one cycle when catching up across midnight.
-	livenessMaxDaysPerCycle = 3
+	// realTime replicas lag up to ~7h and serve rows late and out of order,
+	// so the days overlapping this horizon are refetched and deduplicated.
+	livenessLateness = 8 * time.Hour
 )
 
 type LivenessTMeta struct {
@@ -74,8 +75,18 @@ type GTMLivenessTrafficExporter struct {
 type livenessTarget struct {
 	domain         string
 	cfg            *LivenessTestConfig
-	last           time.Time // timestamp of the last processed report row
-	fetchedThrough time.Time // report window end at the last fetch of its last day
+	since          time.Time                  // rows up to this time are ignored
+	seen           map[livenessEvent]struct{} // errors already processed, within the fetched days
+	fetchedThrough time.Time                  // report window end at the last complete fetch
+}
+
+// livenessEvent identifies one datacenter error of a report row.
+type livenessEvent struct {
+	ts                        time.Time
+	datacenter                int
+	agentIP, targetIP, target string
+	testName                  string
+	errorCode                 int64
 }
 
 func NewLivenessTrafficCollector(api *APIPool, r *prometheus.Registry, gtmMetricsConfig GTMMetricsConfig, gtmMetricPrefix string, tstart time.Time, lookbackDuration time.Duration, opts PollOptions) *GTMLivenessTrafficExporter {
@@ -93,7 +104,7 @@ func NewLivenessTrafficCollector(api *APIPool, r *prometheus.Registry, gtmMetric
 	}
 	for _, domain := range gtmMetricsConfig.Domains {
 		for _, prop := range domain.Liveness {
-			l.targets = append(l.targets, &livenessTarget{domain: domain.Name, cfg: prop, last: tstart})
+			l.targets = append(l.targets, &livenessTarget{domain: domain.Name, cfg: prop, since: tstart, seen: map[livenessEvent]struct{}{}})
 		}
 	}
 	return l
@@ -176,40 +187,36 @@ func startOfDay(t time.Time) time.Time {
 }
 
 func (l *GTMLivenessTrafficExporter) pollTarget(ctx context.Context, sess session.Session, t *livenessTarget, windowStart, windowEnd time.Time) {
-	start := t.last.Add(time.Minute)
-	if !windowStart.Before(start) {
-		start = windowStart
-	} else if !windowEnd.After(start) {
-		start = windowEnd
+	from := windowEnd.Add(-livenessLateness)
+	if t.since.After(from) {
+		from = t.since
 	}
-	day := startOfDay(start)
-	lastDay := startOfDay(windowEnd)
+	if windowStart.After(from) {
+		from = windowStart
+	}
+	firstDay := startOfDay(from)
 
-	// Walk forward day by day: a past day with no new row is done for good.
-	for i := 0; i < livenessMaxDaysPerCycle && !day.After(lastDay); i++ {
-		rows, err := l.fetchNewRows(ctx, sess, t, day)
+	for day := firstDay; !day.After(windowEnd); day = day.Add(24 * time.Hour) {
+		rows, err := l.fetchRows(ctx, sess, t, day)
 		if err != nil {
 			logrus.Warnf("Unable to get liveness report for property %s in domain %s ... Skipping. Error: %s", t.cfg.PropertyName, t.domain, err)
 			return
 		}
-		// Every new row at once: a burst holds one row per test agent, all
-		// within minutes. The cache keeps the latest row per series.
 		now := l.now()
 		for _, r := range rows {
 			l.processRow(t, r.row, r.ts, now)
 		}
-		if day.Equal(lastDay) {
-			t.fetchedThrough = windowEnd
-			return
+	}
+	t.fetchedThrough = windowEnd
+	// Days no longer fetched cannot bring a duplicate back.
+	for ev := range t.seen {
+		if ev.ts.Before(firstDay) {
+			delete(t.seen, ev)
 		}
-		if endOfDay := day.Add(24*time.Hour - time.Second); endOfDay.After(t.last) {
-			t.last = endOfDay
-		}
-		day = day.Add(24 * time.Hour)
 	}
 }
 
-func (l *GTMLivenessTrafficExporter) fetchNewRows(ctx context.Context, sess session.Session, t *livenessTarget, day time.Time) ([]pendingRow[*LivenessTData], error) {
+func (l *GTMLivenessTrafficExporter) fetchRows(ctx context.Context, sess session.Session, t *livenessTarget, day time.Time) ([]pendingRow[*LivenessTData], error) {
 	query := url.Values{}
 	query.Set("date", day.Format(GTMTrafficDateFormat))
 	// Without realTime the API returns an arbitrary slice of ~120 rows of the day.
@@ -234,7 +241,7 @@ func (l *GTMLivenessTrafficExporter) fetchNewRows(ctx context.Context, sess sess
 			logrus.Errorf("Instance timestamp invalid ... Skipping. Error: %s", err)
 			continue
 		}
-		if ts.After(t.last) {
+		if ts.After(t.since) {
 			rows = append(rows, pendingRow[*LivenessTData]{row: row, ts: ts})
 		}
 	}
@@ -255,6 +262,12 @@ func (l *GTMLivenessTrafficExporter) processRow(t *livenessTarget, row *Liveness
 	tsLabel := ts.Format(time.RFC3339)
 
 	for _, dc := range row.Datacenters {
+		ev := livenessEvent{ts, dc.DatacenterID, dc.AgentIP, dc.TargetIP, dc.TrafficTargetName, dc.TestName, dc.ErrorCode}
+		if _, dup := t.seen[ev]; dup {
+			continue
+		}
+		t.seen[ev] = struct{}{}
+
 		labelNames := []string{"domain", "property", "datacenter"}
 		labelValues := []string{t.domain, prop.PropertyName, strconv.Itoa(dc.DatacenterID)}
 		if prop.AgentIP == dc.AgentIP {
@@ -291,5 +304,4 @@ func (l *GTMLivenessTrafficExporter) processRow(t *livenessTarget, row *Liveness
 
 		l.observe(t.domain, prop.PropertyName, dc.DatacenterID, float64(dc.Duration))
 	}
-	t.last = ts
 }

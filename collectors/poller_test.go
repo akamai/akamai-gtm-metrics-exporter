@@ -448,3 +448,94 @@ func TestLivenessDurationIsTheLongestOfTheExposure(t *testing.T) {
 	c.processRow(c.targets[0], liveRow("2026-10-02T21:39:00Z", 3135, 2503, 120), ts("2026-10-02T21:39:00Z"), later)
 	assert.Equal(t, 120.0, collectSamples(t, c)[key].value)
 }
+
+// livenessCounts returns the histogram observations per datacenter.
+func livenessCounts(t *testing.T, reg *prometheus.Registry) map[string]uint64 {
+	t.Helper()
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+	out := map[string]uint64{}
+	for _, mf := range mfs {
+		if mf.GetName() != "akamai_gtm_property_liveness_errors_duration_per_datacenter_histogram" {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			for _, l := range m.GetLabel() {
+				if l.GetName() == "datacenter" {
+					out[l.GetValue()] = m.GetHistogram().GetSampleCount()
+				}
+			}
+		}
+	}
+	return out
+}
+
+// realTime replicas serve rows late and out of order: a row older than the last
+// one seen is still counted, and a row served twice is counted once.
+func TestLivenessLateAndDuplicateRowsCountedOnce(t *testing.T) {
+	f := newFakeAPI(t)
+	f.livenessWindow = [2]time.Time{ts("2026-07-01T00:00:00Z"), ts("2026-10-02T21:20:00Z")}
+	dup := liveRow("2026-10-02T21:15:00Z", 3135, 2503, 60)
+	f.liveRows["example.akadns.net/www"] = []*LivenessTData{dup, dup}
+	reg := prometheus.NewRegistry()
+	c := NewLivenessTrafficCollector(f.pool(t, 1), reg, livenessConfig("example.akadns.net", "www"), "akamai_gtm_", ts("2026-10-02T21:00:00Z"), time.Hour, testOpts)
+	c.now = func() time.Time { return ts("2026-10-02T21:21:00Z") }
+	require.NoError(t, c.poll(context.Background()))
+	assert.Equal(t, map[string]uint64{"3135": 1}, livenessCounts(t, reg))
+
+	f.mu.Lock()
+	f.livenessWindow[1] = ts("2026-10-02T21:22:00Z")
+	f.liveRows["example.akadns.net/www"] = append(f.liveRows["example.akadns.net/www"], liveRow("2026-10-02T21:10:00Z", 3136, 2503, 30))
+	f.mu.Unlock()
+	c.now = func() time.Time { return ts("2026-10-02T21:23:00Z") }
+	require.NoError(t, c.poll(context.Background()))
+
+	assert.Equal(t, map[string]uint64{"3135": 1, "3136": 1}, livenessCounts(t, reg))
+	assert.Contains(t, collectSamples(t, c),
+		`akamai_gtm_property_liveness_errors_datacenter_failures{datacenter="3136",domain="example.akadns.net",errorcode="2503",property="www"}`,
+		"a late row still within the exposure is shown")
+}
+
+// After midnight the previous day keeps being refetched while late rows can still land in it.
+func TestLivenessLateRowOfPreviousDay(t *testing.T) {
+	f := newFakeAPI(t)
+	f.livenessWindow = [2]time.Time{ts("2026-07-01T00:00:00Z"), ts("2026-10-02T00:10:00Z")}
+	f.liveRows["example.akadns.net/www"] = []*LivenessTData{liveRow("2026-10-02T00:05:00Z", 3135, 2503, 60)}
+	reg := prometheus.NewRegistry()
+	c := NewLivenessTrafficCollector(f.pool(t, 1), reg, livenessConfig("example.akadns.net", "www"), "akamai_gtm_", ts("2026-10-01T20:00:00Z"), time.Hour, testOpts)
+	c.now = func() time.Time { return ts("2026-10-02T00:12:00Z") }
+	require.NoError(t, c.poll(context.Background()))
+
+	f.mu.Lock()
+	f.livenessWindow[1] = ts("2026-10-02T02:00:00Z")
+	f.liveRows["example.akadns.net/www"] = append(f.liveRows["example.akadns.net/www"], liveRow("2026-10-01T23:50:00Z", 3136, 2503, 60))
+	f.mu.Unlock()
+	require.NoError(t, c.poll(context.Background()))
+	assert.Equal(t, map[string]uint64{"3135": 1, "3136": 1}, livenessCounts(t, reg))
+
+	// Past the lateness horizon the previous day is no longer fetched and forgotten.
+	f.mu.Lock()
+	f.livenessWindow[1] = ts("2026-10-02T09:00:00Z")
+	f.mu.Unlock()
+	calls := f.callCount("live-report")
+	require.NoError(t, c.poll(context.Background()))
+	assert.Equal(t, calls+1, f.callCount("live-report"), "today only")
+	for ev := range c.targets[0].seen {
+		assert.False(t, ev.ts.Before(ts("2026-10-02T00:00:00Z")), "seen entry of a day no longer fetched: %v", ev.ts)
+	}
+	assert.Equal(t, map[string]uint64{"3135": 1, "3136": 1}, livenessCounts(t, reg))
+}
+
+// A failed fetch is retried next cycle without counting the rows already processed twice.
+func TestLivenessRetryAfterErrorDoesNotDoubleCount(t *testing.T) {
+	f := newFakeAPI(t)
+	f.livenessWindow = [2]time.Time{ts("2026-07-01T00:00:00Z"), ts("2026-10-02T21:20:00Z")}
+	f.liveRows["example.akadns.net/www"] = burstRows("2026-10-02T21:12:00Z", 5)
+	reg := prometheus.NewRegistry()
+	c := NewLivenessTrafficCollector(f.pool(t, 1), reg, livenessConfig("example.akadns.net", "www"), "akamai_gtm_", ts("2026-10-02T21:00:00Z"), time.Hour, testOpts)
+	c.now = func() time.Time { return ts("2026-10-02T21:21:00Z") }
+	require.NoError(t, c.poll(context.Background()))
+	c.targets[0].fetchedThrough = time.Time{} // as if the cycle failed after processing
+	require.NoError(t, c.poll(context.Background()))
+	assert.Equal(t, map[string]uint64{"3135": 5}, livenessCounts(t, reg))
+}

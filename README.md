@@ -290,6 +290,8 @@ domains:
 
 This example configuration instructs the collector to retrieve liveness test failure activity from `property_name` `test_property`. The liveness failures data can be further filtered by `agent_ip` or `target_ip`. If both are specified, `target_ip` will be used. Thus, in the example above, the returned test failure data will be filtered for tests associated with the `target_ip` specified. To retrieve all liveness test failures for the property, omit the filter keys.
 
+Each cycle refetches every report day overlapping the last 8 hours (so the previous day until 08:00 UTC) and counts each error once, identified by its timestamp, datacenter, agent, target, test and error code. Errors the API serves late are still counted; they are only shown by the failure metrics while within `--liveness.exposure` of their timestamp.
+
 #### Metrics
 
 The liveness collector gathers the following metrics from the GTM Report API that returns data reflecting when tests are executed and failure status.
