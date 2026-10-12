@@ -164,6 +164,12 @@ Flags:
       --log.level="info"  Only log messages with the given severity or above. Valid levels: [debug, info, warn, error, fatal]
       --log.format="logger:stderr"
                           Set the log target and format. Example: "logger:stdout?json=true".
+      --poll.interval=1m    Interval between two polls of the Akamai reporting API.
+      --poll.concurrency=4  Maximum concurrent Akamai API requests per collector.
+      --akamai.timeout=30s  Timeout of a single Akamai API request.
+      --metrics.ttl=10m     How long the last traffic report sample of a series stays exposed after it was fetched.
+      --report.settle-delay=0s  Only read traffic report buckets that ended at least this long ago.
+      --liveness.exposure=15m   How long after it happened a liveness error stays exposed.
       --version           Show application version.
 ```
 
@@ -186,6 +192,14 @@ Flags:
 ## Collectors
 
 The Akamai GTM Exporter contains collectors to gather traffic information for GTM domain datacenters and properties, as well as property liveness test failures. Each of these collectors has its own configuration, metrics and behaviors.
+
+Collectors poll the Akamai reporting API in the background every `--poll.interval`; a scrape only serves the cached samples and never calls the API. Akamai keeps revising a traffic bucket for over an hour after it first shows in the report window, so an early read is low: `--report.settle-delay` waits for the bucket to settle, at the cost of that much delay. A traffic report row is exposed once fetched and stays exposed for `--metrics.ttl`, or until a newer row replaces it. Liveness reports are read with `realTime=true`: without it the API returns an arbitrary slice of about 120 rows of the day. A liveness error is exposed for `--liveness.exposure` after it happened, so a restart never shows past errors as current; the histograms and summaries count every error row.
+
+| Metric | Description |
+| ------ | ----------- |
+| `akamai_gtm_metrics_exporter_poll_duration_seconds{collector}` | Duration of the last poll cycle |
+| `akamai_gtm_metrics_exporter_last_successful_poll_timestamp_seconds{collector}` | Unix time of the last poll cycle whose report window could be fetched |
+| `akamai_gtm_metrics_exporter_api_requests_total{collector,api,outcome}` | Akamai API requests, `api` is `window` or `report`, `outcome` is `success` or `error` |
 
 ### Datacenter traffic
 
@@ -275,6 +289,8 @@ domains:
 ```
 
 This example configuration instructs the collector to retrieve liveness test failure activity from `property_name` `test_property`. The liveness failures data can be further filtered by `agent_ip` or `target_ip`. If both are specified, `target_ip` will be used. Thus, in the example above, the returned test failure data will be filtered for tests associated with the `target_ip` specified. To retrieve all liveness test failures for the property, omit the filter keys.
+
+Each cycle refetches every report day overlapping the last 8 hours (so the previous day until 08:00 UTC) and counts each error once, identified by its timestamp, datacenter, agent, target, test and error code. Errors the API serves late are still counted; they are only shown by the failure metrics while within `--liveness.exposure` of their timestamp.
 
 #### Metrics
 

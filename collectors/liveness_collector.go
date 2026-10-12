@@ -16,9 +16,9 @@ package collectors
 import (
 	"context"
 	"fmt"
-	"net/http"
+	"net/url"
 	"strconv"
-	"strings"
+	"sync"
 	"time"
 
 	"github.com/akamai/AkamaiOPEN-edgegrid-golang/v13/pkg/session"
@@ -26,9 +26,13 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-var (
-	gtmLivenessTrafficExporter GTMLivenessTrafficExporter
-	durationBuckets            = []float64{60, 1800, 3600, 7200, 14400}
+var durationBuckets = []float64{60, 1800, 3600, 7200, 14400}
+
+const (
+	livenessCollectorName = "liveness"
+	// realTime replicas lag up to ~7h and serve rows late and out of order,
+	// so the days overlapping this horizon are refetched and deduplicated.
+	livenessLateness = 8 * time.Hour
 )
 
 type LivenessTMeta struct {
@@ -54,307 +58,250 @@ type GTMLivenessTrafficExporter struct {
 	GTMConfig                GTMMetricsConfig
 	LivenessMetricPrefix     string
 	LivenessLookbackDuration time.Duration
-	LastTimestamp            map[string]map[string]time.Time // index by domain, liveness
 	LivenessRegistry         *prometheus.Registry
-	AkamaiSession            session.Session
-	ctx                      context.Context
+	api                      *APIPool
+	opts                     PollOptions
+	cache                    *sampleCache
+	targets                  []*livenessTarget
+	now                      func() time.Time
+
+	// Per datacenter histograms and summaries, created on first error.
+	mu         sync.Mutex
+	histograms map[string]prometheus.Histogram
+	summaries  map[string]prometheus.Summary
 }
 
-func NewLivenessTrafficCollector(ctx context.Context, sess session.Session, r *prometheus.Registry, gtmMetricsConfig GTMMetricsConfig, gtmMetricPrefix string, tstart time.Time, lookbackDuration time.Duration) *GTMLivenessTrafficExporter {
+// livenessTarget is only touched by the worker polling it.
+type livenessTarget struct {
+	domain         string
+	cfg            *LivenessTestConfig
+	since          time.Time                  // rows up to this time are ignored
+	seen           map[livenessEvent]struct{} // errors already processed, within the fetched days
+	fetchedThrough time.Time                  // report window end at the last complete fetch
+}
 
-	gtmLivenessTrafficExporter = GTMLivenessTrafficExporter{
+// livenessEvent identifies one datacenter error of a report row.
+type livenessEvent struct {
+	ts                        time.Time
+	datacenter                int
+	agentIP, targetIP, target string
+	testName                  string
+	errorCode                 int64
+}
+
+func NewLivenessTrafficCollector(api *APIPool, r *prometheus.Registry, gtmMetricsConfig GTMMetricsConfig, gtmMetricPrefix string, tstart time.Time, lookbackDuration time.Duration, opts PollOptions) *GTMLivenessTrafficExporter {
+	l := &GTMLivenessTrafficExporter{
 		GTMConfig:                gtmMetricsConfig,
+		LivenessMetricPrefix:     gtmMetricPrefix + "property_liveness_errors",
 		LivenessLookbackDuration: lookbackDuration,
-		AkamaiSession:            sess,
-		ctx:                      ctx,
+		LivenessRegistry:         r,
+		api:                      api,
+		opts:                     opts,
+		cache:                    newSampleCache(opts.CacheTTL),
+		histograms:               make(map[string]prometheus.Histogram),
+		now:                      time.Now,
+		summaries:                make(map[string]prometheus.Summary),
 	}
-	gtmLivenessTrafficExporter.LivenessMetricPrefix = gtmMetricPrefix + "property_liveness_errors"
-	gtmLivenessTrafficExporter.LivenessLookbackDuration = lookbackDuration
-	gtmLivenessTrafficExporter.LivenessRegistry = r
-
-	domainMap := make(map[string]map[string]time.Time)
 	for _, domain := range gtmMetricsConfig.Domains {
-		tStampMap := make(map[string]time.Time)
-		livenessDurationHistogramMap[domain.Name] = make(map[string]map[int]prometheus.Histogram)
-		livenessErrorsSummaryMap[domain.Name] = make(map[string]map[int]prometheus.Summary)
 		for _, prop := range domain.Liveness {
-			livenessDurationHistogramMap[domain.Name][prop.PropertyName] = make(map[int]prometheus.Histogram)
-			livenessErrorsSummaryMap[domain.Name][prop.PropertyName] = make(map[int]prometheus.Summary)
-			tStampMap[prop.PropertyName] = tstart
+			l.targets = append(l.targets, &livenessTarget{domain: domain.Name, cfg: prop, since: tstart, seen: map[livenessEvent]struct{}{}})
 		}
-		domainMap[domain.Name] = tStampMap
 	}
-	gtmLivenessTrafficExporter.LastTimestamp = domainMap
-
-	return &gtmLivenessTrafficExporter
+	return l
 }
 
-// Summaries map by domain, property, datacenter
-var livenessDurationHistogramMap = make(map[string]map[string]map[int]prometheus.Histogram)
-var livenessErrorsSummaryMap = make(map[string]map[string]map[int]prometheus.Summary)
-
-func (l *GTMLivenessTrafficExporter) getDatacenterHistogramMetrics(domain, property string, dcid int) map[string]interface{} {
-	histMap := make(map[string]interface{})
-	if histo, ok := livenessDurationHistogramMap[domain][property][dcid]; ok {
-		histMap["duration"] = histo
-	} else {
-		labels := prometheus.Labels{"domain": domain, "property": property, "datacenter": strconv.Itoa(dcid)}
-		livenessDurationHistogramMap[domain][property][dcid] = prometheus.NewHistogram(
-			prometheus.HistogramOpts{
-				Namespace:   gtmLivenessTrafficExporter.LivenessMetricPrefix,
-				Name:        "duration_per_datacenter_histogram",
-				Help:        "Histogram of datacenter error duration (per domain and property)",
-				ConstLabels: labels,
-				Buckets:     durationBuckets,
-			})
-		l.LivenessRegistry.MustRegister(livenessDurationHistogramMap[domain][property][dcid])
-		histMap["duration"] = livenessDurationHistogramMap[domain][property][dcid]
+func (l *GTMLivenessTrafficExporter) observe(domain, property string, dcid int, duration float64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	key := seriesKey(domain, property, strconv.Itoa(dcid))
+	labels := prometheus.Labels{"domain": domain, "property": property, "datacenter": strconv.Itoa(dcid)}
+	histo, ok := l.histograms[key]
+	if !ok {
+		histo = prometheus.NewHistogram(prometheus.HistogramOpts{
+			Namespace:   l.LivenessMetricPrefix,
+			Name:        "duration_per_datacenter_histogram",
+			Help:        "Histogram of datacenter error duration (per domain and property)",
+			ConstLabels: labels,
+			Buckets:     durationBuckets,
+		})
+		l.LivenessRegistry.MustRegister(histo)
+		l.histograms[key] = histo
 	}
-
-	if esum, ok := livenessErrorsSummaryMap[domain][property][dcid]; ok {
-		histMap["errors"] = esum
-	} else {
-		labels := prometheus.Labels{"domain": domain, "property": property, "datacenter": strconv.Itoa(dcid)}
-		livenessErrorsSummaryMap[domain][property][dcid] = prometheus.NewSummary(
-			prometheus.SummaryOpts{
-				Namespace:   gtmLivenessTrafficExporter.LivenessMetricPrefix,
-				Name:        "errors_per_datacenter_summary",
-				Help:        "Summary of datacenter errors (per domain and property)",
-				ConstLabels: labels,
-				MaxAge:      gtmLivenessTrafficExporter.LivenessLookbackDuration,
-				BufCap:      prometheus.DefBufCap * 2,
-			})
-		l.LivenessRegistry.MustRegister(livenessErrorsSummaryMap[domain][property][dcid])
-		histMap["errors"] = livenessErrorsSummaryMap[domain][property][dcid]
+	summary, ok := l.summaries[key]
+	if !ok {
+		summary = prometheus.NewSummary(prometheus.SummaryOpts{
+			Namespace:   l.LivenessMetricPrefix,
+			Name:        "errors_per_datacenter_summary",
+			Help:        "Summary of datacenter errors (per domain and property)",
+			ConstLabels: labels,
+			MaxAge:      l.LivenessLookbackDuration,
+			BufCap:      prometheus.DefBufCap * 2,
+		})
+		l.LivenessRegistry.MustRegister(summary)
+		l.summaries[key] = summary
 	}
-	return histMap
+	histo.Observe(duration)
+	summary.Observe(1)
 }
 
 func (l *GTMLivenessTrafficExporter) Describe(ch chan<- *prometheus.Desc) {
 	ch <- prometheus.NewDesc(l.LivenessMetricPrefix, "Akamai GTM Property Liveness Errors", nil, nil)
 }
 
+// Collect serves the samples fetched by the background poller.
 func (l *GTMLivenessTrafficExporter) Collect(ch chan<- prometheus.Metric) {
-	logrus.Debug("Entering GTM Property Liveness Errors Collect")
+	l.cache.collect(ch, l.now())
+}
 
-	endtime := time.Now().UTC() // Use same current time for all zones
+// Start polls the reporting API in the background until ctx is done.
+func (l *GTMLivenessTrafficExporter) Start(ctx context.Context) {
+	if len(l.targets) == 0 {
+		return
+	}
+	go pollLoop(ctx, livenessCollectorName, l.opts.Interval, l.poll)
+}
 
-	// Collect metrics for each domain and liveness
-	for _, domain := range l.GTMConfig.Domains {
-		logrus.Debugf("Processing domain %s", domain.Name)
-		for _, prop := range domain.Liveness {
-			// get last timestamp recorded. make sure diff > 5 mins.
-			lasttime := l.LastTimestamp[domain.Name][prop.PropertyName].Add(time.Minute)
-			logrus.Debugf("Fetching liveness errors Report for property %s in domain %s.", prop.PropertyName, domain.Name)
+func (l *GTMLivenessTrafficExporter) poll(ctx context.Context) error {
+	windowStart, windowEnd, err := fetchWindow(ctx, l.api.sessions[0], livenessCollectorName, "/gtm-api/v1/reports/liveness-tests/window")
+	if err != nil {
+		return err
+	}
+	var jobs []apiJob
+	for _, t := range l.targets {
+		// The report is per day: refetching it is only worth it once the window moved.
+		if !windowEnd.After(t.fetchedThrough) {
+			continue
+		}
+		t := t
+		jobs = append(jobs, func(ctx context.Context, sess session.Session) {
+			l.pollTarget(ctx, sess, t, windowStart, windowEnd)
+		})
+	}
+	l.api.run(ctx, jobs)
+	return nil
+}
 
-			livenessTrafficReport, err := l.retrieveLivenessTraffic(domain.Name, prop.PropertyName, prop.AgentIP, prop.TargetIP, lasttime)
+func startOfDay(t time.Time) time.Time {
+	y, m, d := t.UTC().Date()
+	return time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
+}
 
-			if err != nil {
-				errStr := err.Error()
-				if strings.Contains(errStr, "500") {
-					logrus.Warnf("Unable to get liveness errors report for property %s. Internal error ... Skipping.", prop.PropertyName)
-					continue
-				}
-				if strings.Contains(errStr, "400") {
-					logrus.Warnf("Unable to get liveness errors report for property %s. ... Skipping.", prop.PropertyName)
-					logrus.Errorf("%s", err.Error())
-					continue
-				}
-				logrus.Errorf("Unable to get liveness report for property %s ... Skipping. Error: %s", prop.PropertyName, err.Error())
-				continue
-			}
+func (l *GTMLivenessTrafficExporter) pollTarget(ctx context.Context, sess session.Session, t *livenessTarget, windowStart, windowEnd time.Time) {
+	from := windowEnd.Add(-livenessLateness)
+	if t.since.After(from) {
+		from = t.since
+	}
+	if windowStart.After(from) {
+		from = windowStart
+	}
+	firstDay := startOfDay(from)
 
-			// Handle Day Boundary Crossing
-			if len(livenessTrafficReport.DataRows) < 1 && endtime.Day() != lasttime.Day() {
-				lasttime = lasttime.Add(23*time.Hour + 59*time.Minute + 59*time.Second)
-				livenessTrafficReport, err = l.retrieveLivenessTraffic(domain.Name, prop.PropertyName, prop.AgentIP, prop.TargetIP, lasttime)
-				if err != nil {
-					if strings.Contains(err.Error(), "500") || strings.Contains(err.Error(), "400") {
-						logrus.Warnf("Unable to get liveness errors report for property %s after day bump. Skipping.", prop.PropertyName)
-						continue
-					}
-					logrus.Errorf("Unable to get liveness report for property %s after day bump. Error: %s", prop.PropertyName, err.Error())
-					logrus.Errorf("%s", err.Error())
-					continue
-				}
-			}
-
-			logrus.Debugf("Traffic Metadata: [%v]", livenessTrafficReport.Metadata)
-
-			for _, reportInstance := range livenessTrafficReport.DataRows {
-				instanceTimestamp, err := parseTimeString(reportInstance.Timestamp, GTMTrafficLongTimeFormat)
-				if err != nil {
-					logrus.Errorf("Instance timestamp invalid ... Skipping. Error: %s", err.Error())
-					continue
-				}
-
-				if !instanceTimestamp.After(l.LastTimestamp[domain.Name][prop.PropertyName]) {
-					logrus.Debugf("Instance timestamp: [%v]. Last timestamp: [%v]", instanceTimestamp, l.LastTimestamp[domain.Name][prop.PropertyName])
-					logrus.Warnf("Attempting to re process report instance: [%v]. Skipping.", reportInstance)
-					continue
-				}
-
-				logrus.Debugf("Instance timestamp: [%v]. Last timestamp: [%v]", instanceTimestamp, l.LastTimestamp[domain.Name][prop.PropertyName])
-				var baseLabels = []string{"domain", "property", "datacenter"}
-				for _, instanceDC := range reportInstance.Datacenters {
-					var tsLabels = baseLabels
-					labelVals := []string{domain.Name, prop.PropertyName, strconv.Itoa(instanceDC.DatacenterID)}
-
-					if prop.AgentIP == instanceDC.AgentIP {
-						tsLabels = append(tsLabels, "agentip")
-						labelVals = append(labelVals, instanceDC.AgentIP)
-					}
-					if prop.TargetIP == instanceDC.TargetIP {
-						tsLabels = append(tsLabels, "targetip")
-						labelVals = append(labelVals, instanceDC.TargetIP)
-					}
-					if prop.ErrorCode {
-						tsLabels = append(tsLabels, "errorcode")
-						labelVals = append(labelVals, fmt.Sprintf("%v", instanceDC.ErrorCode))
-					}
-
-					ts := instanceTimestamp.Format(time.RFC3339)
-					if l.GTMConfig.TSLabel {
-						tsLabels = append(tsLabels, "interval_timestamp")
-						labelVals = append(labelVals, ts)
-					}
-
-					desc := prometheus.NewDesc(prometheus.BuildFQName(l.LivenessMetricPrefix, "", "datacenter_failures"), "Number of datacenter failures (per domain, property, datacenter)", tsLabels, nil)
-					logrus.Debugf("Creating error failures counter metric. Domain: %s, Property: %s, Datacenter: %d, Timestamp: %v", domain.Name, prop.PropertyName, instanceDC.DatacenterID, ts)
-					var errorsmetric, durmetric prometheus.Metric
-					errorsmetric = prometheus.MustNewConstMetric(
-						desc, prometheus.CounterValue, 1, labelVals...)
-					if l.GTMConfig.UseTimestamp != nil && !*l.GTMConfig.UseTimestamp {
-						ch <- errorsmetric
-					} else {
-						ch <- prometheus.NewMetricWithTimestamp(instanceTimestamp, errorsmetric)
-					}
-					desc = prometheus.NewDesc(prometheus.BuildFQName(l.LivenessMetricPrefix, "", "datacenter_failure_duration"), "Datacenter failure duration (per domain, property, datacenter)", tsLabels, nil)
-					logrus.Debugf("Creating failure duration gauge metric. Domain: %s, Property: %s, Datacenter: %d, Timestamp: %v", domain.Name, prop.PropertyName, instanceDC.DatacenterID, ts)
-					durmetric = prometheus.MustNewConstMetric(
-						desc, prometheus.GaugeValue, float64(instanceDC.Duration), labelVals...)
-					if l.GTMConfig.UseTimestamp != nil && !*l.GTMConfig.UseTimestamp {
-						ch <- durmetric
-					} else {
-						ch <- prometheus.NewMetricWithTimestamp(instanceTimestamp, durmetric)
-					}
-					maps := l.getDatacenterHistogramMetrics(domain.Name, prop.PropertyName, instanceDC.DatacenterID)
-					maps["duration"].(prometheus.Histogram).Observe(float64(instanceDC.Duration))
-					maps["errors"].(prometheus.Summary).Observe(float64(1))
-
-				} // datacenter end
-
-				// Update last timestamp processed
-				if instanceTimestamp.After(l.LastTimestamp[domain.Name][prop.PropertyName]) {
-					logrus.Debugf("Updating Last Timestamp from %v TO %v", l.LastTimestamp[domain.Name][prop.PropertyName], instanceTimestamp)
-					l.LastTimestamp[domain.Name][prop.PropertyName] = instanceTimestamp
-				}
-				// only process one each interval!
-				break
-			}
+	for day := firstDay; !day.After(windowEnd); day = day.Add(24 * time.Hour) {
+		rows, err := l.fetchRows(ctx, sess, t, day)
+		if err != nil {
+			logrus.Warnf("Unable to get liveness report for property %s in domain %s ... Skipping. Error: %s", t.cfg.PropertyName, t.domain, err)
+			return
+		}
+		now := l.now()
+		for _, r := range rows {
+			l.processRow(t, r.row, r.ts, now)
+		}
+	}
+	t.fetchedThrough = windowEnd
+	// Days no longer fetched cannot bring a duplicate back.
+	for ev := range t.seen {
+		if ev.ts.Before(firstDay) {
+			delete(t.seen, ev)
 		}
 	}
 }
 
-func (l *GTMLivenessTrafficExporter) retrieveLivenessTraffic(domain, prop, agentID, targetID string, start time.Time) (*LivenessErrorsResponse, error) {
-	qargs := make(map[string]string)
-
-	if len(targetID) > 0 {
-		qargs["targetIp"] = targetID // Takes priority
-		logrus.Info("Target IP Set. Using Target IP.")
+func (l *GTMLivenessTrafficExporter) fetchRows(ctx context.Context, sess session.Session, t *livenessTarget, day time.Time) ([]pendingRow[*LivenessTData], error) {
+	query := url.Values{}
+	query.Set("date", day.Format(GTMTrafficDateFormat))
+	// Without realTime the API returns an arbitrary slice of ~120 rows of the day.
+	query.Set("realTime", "true")
+	if t.cfg.TargetIP != "" {
+		query.Set("targetIp", t.cfg.TargetIP) // takes priority over agentIp
+	} else if t.cfg.AgentIP != "" {
+		query.Set("agentIp", t.cfg.AgentIP)
 	}
-	if len(agentID) > 0 {
-		if len(targetID) > 0 {
-			logrus.Warn("Both agentIp and targetIp filters set. Using targetIp ONLY")
-		} else {
-			qargs["agentIp"] = agentID
-			logrus.Info("Agent IP Set. Using Agent IP.")
-		}
-	}
+	path := fmt.Sprintf("/gtm-api/v1/reports/liveness-tests/domains/%s/properties/%s", t.domain, t.cfg.PropertyName)
 
-	var apiWindow struct {
-		Start string `json:"start"`
-		End   string `json:"end"`
-	}
-
-	windowPath := "/gtm-api/v1/reports/liveness-tests/window"
-	windowReq, err := http.NewRequestWithContext(l.ctx, http.MethodGet, windowPath, nil)
-	if err != nil {
+	var report LivenessErrorsResponse
+	if err := getJSON(ctx, sess, livenessCollectorName, "report", path, query, &report); err != nil {
 		return nil, err
 	}
+	sortLivenessDataRowsByTimestamp(report.DataRows)
 
-	_, err = l.AkamaiSession.Exec(windowReq, &apiWindow)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch liveness window: %w", err)
-	}
-
-	// Convert API strings to time.Time objects
-	windowStart, err := time.Parse(time.RFC3339, apiWindow.Start)
-	if err != nil {
-		return nil, err
-	}
-	windowEnd, err := time.Parse(time.RFC3339, apiWindow.End)
-	if err != nil {
-		return nil, err
-	}
-
-	if windowStart.Before(start) {
-		if windowEnd.After(start) {
-			qargs["date"], err = convertTimeFormat(start, GTMTrafficDateFormat)
-			if err != nil {
-				return nil, err
-			}
-		} else {
-			qargs["date"], err = convertTimeFormat(windowEnd, GTMTrafficDateFormat)
-			if err != nil {
-				return nil, err
-			}
-		}
-	} else {
-		qargs["date"], err = convertTimeFormat(windowStart, GTMTrafficDateFormat)
+	var rows []pendingRow[*LivenessTData]
+	for _, row := range report.DataRows {
+		ts, err := parseTimeString(row.Timestamp, GTMTrafficLongTimeFormat)
 		if err != nil {
-			return nil, err
+			logrus.Errorf("Instance timestamp invalid ... Skipping. Error: %s", err)
+			continue
+		}
+		if ts.After(t.since) {
+			rows = append(rows, pendingRow[*LivenessTData]{row: row, ts: ts})
 		}
 	}
+	return rows, nil
+}
 
-	path := fmt.Sprintf("/gtm-api/v1/reports/liveness-tests/domains/%s/properties/%s", domain, prop)
-	req, err := http.NewRequestWithContext(l.ctx, http.MethodGet, path, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	if _, ok := qargs["date"]; !ok {
-		return nil, fmt.Errorf("GetLivenessErrorsReport: date parameter is required")
-	}
-
-	q := req.URL.Query()
-	for k, v := range qargs {
-		switch k {
-		case "date":
-			q.Add(k, v)
-		case "agentIp":
-			q.Add(k, v)
-		case "targetIp":
-			q.Add(k, v)
+func (l *GTMLivenessTrafficExporter) processRow(t *livenessTarget, row *LivenessTData, ts, now time.Time) {
+	prop := t.cfg
+	// Rows already older than the exposure are still counted by the histograms.
+	hold := ts.Add(l.opts.LivenessExposure).Sub(now)
+	expose := func(key string, m prometheus.Metric) {
+		if hold > 0 {
+			l.cache.putUntil(key, m, now.Add(hold))
 		}
 	}
-	req.URL.RawQuery = q.Encode()
+	failuresName := prometheus.BuildFQName(l.LivenessMetricPrefix, "", "datacenter_failures")
+	durationName := prometheus.BuildFQName(l.LivenessMetricPrefix, "", "datacenter_failure_duration")
+	tsLabel := ts.Format(time.RFC3339)
 
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-	var result LivenessErrorsResponse
-	resp, err := l.AkamaiSession.Exec(req, &result)
-	if err != nil {
-		if resp != nil && resp.StatusCode == http.StatusNotFound {
-			return nil, fmt.Errorf("property %s not found in domain %s for liveness report", prop, domain)
+	for _, dc := range row.Datacenters {
+		ev := livenessEvent{ts, dc.DatacenterID, dc.AgentIP, dc.TargetIP, dc.TrafficTargetName, dc.TestName, dc.ErrorCode}
+		if _, dup := t.seen[ev]; dup {
+			continue
 		}
-		return nil, err
-	}
+		t.seen[ev] = struct{}{}
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status: %d", resp.StatusCode)
-	}
+		labelNames := []string{"domain", "property", "datacenter"}
+		labelValues := []string{t.domain, prop.PropertyName, strconv.Itoa(dc.DatacenterID)}
+		if prop.AgentIP == dc.AgentIP {
+			labelNames = append(labelNames, "agentip")
+			labelValues = append(labelValues, dc.AgentIP)
+		}
+		if prop.TargetIP == dc.TargetIP {
+			labelNames = append(labelNames, "targetip")
+			labelValues = append(labelValues, dc.TargetIP)
+		}
+		if prop.ErrorCode {
+			labelNames = append(labelNames, "errorcode")
+			labelValues = append(labelValues, fmt.Sprintf("%v", dc.ErrorCode))
+		}
+		if l.GTMConfig.TSLabel {
+			labelNames = append(labelNames, "interval_timestamp")
+			labelValues = append(labelValues, tsLabel)
+		}
 
-	sortLivenessDataRowsByTimestamp(result.DataRows)
-	return &result, nil
+		failures := prometheus.MustNewConstMetric(
+			prometheus.NewDesc(failuresName, "Number of datacenter failures (per domain, property, datacenter)", labelNames, nil),
+			prometheus.CounterValue, 1, labelValues...)
+		expose(seriesKey(failuresName, labelValues...), withReportTimestamp(l.GTMConfig, ts, failures))
+
+		// A burst mixes rows with and without a duration; expose the longest
+		// failure of the exposure window, not whichever row came last.
+		if hold > 0 {
+			durationDesc := prometheus.NewDesc(durationName, "Datacenter failure duration (per domain, property, datacenter)", labelNames, nil)
+			values := labelValues
+			l.cache.putMax(seriesKey(durationName, labelValues...), float64(dc.Duration), func(v float64) prometheus.Metric {
+				return withReportTimestamp(l.GTMConfig, ts, prometheus.MustNewConstMetric(durationDesc, prometheus.GaugeValue, v, values...))
+			}, now.Add(hold), now)
+		}
+
+		l.observe(t.domain, prop.PropertyName, dc.DatacenterID, float64(dc.Duration))
+	}
 }

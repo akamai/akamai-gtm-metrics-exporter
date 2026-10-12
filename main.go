@@ -23,7 +23,6 @@ import (
 	"time"
 
 	"github.com/akamai/AkamaiOPEN-edgegrid-golang/v13/pkg/edgegrid"
-	"github.com/akamai/AkamaiOPEN-edgegrid-golang/v13/pkg/session"
 	"github.com/akamai/akamai-gtm-metrics-exporter/collectors"
 	kingpin "github.com/alecthomas/kingpin/v2"
 	"github.com/prometheus/client_golang/prometheus"
@@ -56,11 +55,18 @@ var (
 	logLevel  = kingpin.Flag("log.level", "Set the logging level (debug, info, warn, error, fatal)").Default("info").String()
 	logFormat = kingpin.Flag("log.format", "Set the log target and format.").Default("logger:stderr").String()
 
+	pollInterval    = kingpin.Flag("poll.interval", "Interval between two polls of the Akamai reporting API.").Default("1m").Duration()
+	pollConcurrency = kingpin.Flag("poll.concurrency", "Maximum concurrent Akamai API requests per collector.").Default("4").Int()
+	apiTimeout      = kingpin.Flag("akamai.timeout", "Timeout of a single Akamai API request.").Default("30s").Duration()
+	settleDelay     = kingpin.Flag("report.settle-delay", "Only read traffic report buckets that ended at least this long ago: Akamai keeps revising a bucket for over an hour after publishing it.").Default("0s").Duration()
+	livenessExpose  = kingpin.Flag("liveness.exposure", "How long after it happened a liveness error stays exposed.").Default("15m").Duration()
+	metricsTTL      = kingpin.Flag("metrics.ttl", "How long the last traffic report sample of a series stays exposed after it was fetched.").Default("10m").Duration()
+
 	lookbackDuration = lookbackDefaultDuration
 	prefillDuration  = prefillDefaultDuration
 )
 
-func initAkamaiSession(gtmMetricsConfig collectors.GTMMetricsConfig) (session.Session, error) {
+func initAkamaiConfig(gtmMetricsConfig collectors.GTMMetricsConfig) *edgegrid.Config {
 	var config *edgegrid.Config
 	var err error
 
@@ -89,7 +95,7 @@ func initAkamaiSession(gtmMetricsConfig collectors.GTMMetricsConfig) (session.Se
 		}
 	}
 
-	return session.New(session.WithSigner(config))
+	return config
 }
 
 func calcWindowDuration(window string) (time.Duration, error) {
@@ -157,10 +163,14 @@ func main() {
 	}
 	logrus.Debugf("Exporter configuration: [%v]", gtmMetricsConfig)
 
-	// 5. Initialize Session
-	akamaiSession, err := initAkamaiSession(gtmMetricsConfig)
-	if err != nil {
-		logrus.Fatalf("Error initializing Akamai session: %v", err)
+	// 5. Initialize Akamai credentials
+	akamaiConfig := initAkamaiConfig(gtmMetricsConfig)
+	newAPIPool := func() *collectors.APIPool {
+		pool, err := collectors.NewAPIPool(akamaiConfig, *pollConcurrency, *apiTimeout, nil)
+		if err != nil {
+			logrus.Fatalf("Error initializing Akamai session: %v", err)
+		}
+		return pool
 	}
 
 	// 6. Time Window Calculations
@@ -195,9 +205,17 @@ func main() {
 	r.MustRegister(promcollectors.NewGoCollector())
 	r.MustRegister(buildversion.NewCollector(namespace + "metrics_exporter"))
 
-	r.MustRegister(collectors.NewDatacenterTrafficCollector(ctx, akamaiSession, r, gtmMetricsConfig, namespace, tstart, lookbackDuration))
-	r.MustRegister(collectors.NewPropertyTrafficCollector(ctx, akamaiSession, r, gtmMetricsConfig, namespace, tstart, lookbackDuration))
-	r.MustRegister(collectors.NewLivenessTrafficCollector(ctx, akamaiSession, r, gtmMetricsConfig, namespace, tstart, lookbackDuration))
+	collectors.RegisterPollMetrics(r)
+
+	// Reports are polled in the background, a scrape never waits on the Akamai API.
+	pollOpts := collectors.PollOptions{Interval: *pollInterval, CacheTTL: *metricsTTL, SettleDelay: *settleDelay, LivenessExposure: *livenessExpose}
+	dcCollector := collectors.NewDatacenterTrafficCollector(newAPIPool(), r, gtmMetricsConfig, namespace, tstart, lookbackDuration, pollOpts)
+	propertyCollector := collectors.NewPropertyTrafficCollector(newAPIPool(), r, gtmMetricsConfig, namespace, tstart, lookbackDuration, pollOpts)
+	livenessCollector := collectors.NewLivenessTrafficCollector(newAPIPool(), r, gtmMetricsConfig, namespace, tstart, lookbackDuration, pollOpts)
+	r.MustRegister(dcCollector, propertyCollector, livenessCollector)
+	dcCollector.Start(ctx)
+	propertyCollector.Start(ctx)
+	livenessCollector.Start(ctx)
 
 	// 8. HTTP Handlers
 	http.Handle("/metrics", promhttp.HandlerFor(r, promhttp.HandlerOpts{Registry: r}))

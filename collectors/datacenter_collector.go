@@ -16,9 +16,8 @@ package collectors
 import (
 	"context"
 	"fmt"
-	"net/http"
+	"net/url"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/akamai/AkamaiOPEN-edgegrid-golang/v13/pkg/session"
@@ -26,81 +25,66 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-var (
-	gtmDatacenterTrafficExporter GTMDatacenterTrafficExporter
-)
+const datacenterCollectorName = "datacenters"
 
 type GTMDatacenterTrafficExporter struct {
 	GTMConfig          GTMMetricsConfig
 	DCMetricPrefix     string
 	DCLookbackDuration time.Duration
-	LastTimestamp      map[string]map[int]time.Time // index by domain, datacenterid
 	DCRegistry         *prometheus.Registry
-	AkamaiSession      session.Session
-	ctx                context.Context
+	api                *APIPool
+	opts               PollOptions
+	cache              *sampleCache
+	targets            []*dcTarget
+}
+
+// dcTarget is only touched by the worker polling it.
+type dcTarget struct {
+	domain         string
+	cfg            *TrafficDatacenterConfig
+	summary        prometheus.Summary
+	last           time.Time // timestamp of the last processed report row
+	fetchedThrough time.Time // report window end at the last successful fetch
+	pending        []pendingRow[*DatacenterTrafficData]
 }
 
 type DcTrafficResponse struct {
-	Metadata    *Metadata                `json:"metadata"`    // Restored pointer
-	DataRows    []*DatacenterTrafficData `json:"dataRows"`    // Restored pointer slice
-	DataSummary interface{}              `json:"dataSummary"` // Restored DataSummary
-	Links       []interface{}            `json:"links"`       // Interface for parity without old library
+	Metadata    *Metadata                `json:"metadata"`
+	DataRows    []*DatacenterTrafficData `json:"dataRows"`
+	DataSummary interface{}              `json:"dataSummary"`
+	Links       []interface{}            `json:"links"`
 }
 
 type DatacenterTrafficData struct {
 	Timestamp  string             `json:"timestamp"`
-	Properties []*TrafficProperty `json:"properties"` // Restored pointer slice
+	Properties []*TrafficProperty `json:"properties"`
 }
 
-func NewDatacenterTrafficCollector(ctx context.Context, sess session.Session, r *prometheus.Registry, gtmMetricsConfig GTMMetricsConfig, gtmMetricPrefix string, tstart time.Time, lookbackDuration time.Duration) *GTMDatacenterTrafficExporter {
-
-	gtmDatacenterTrafficExporter = GTMDatacenterTrafficExporter{
+func NewDatacenterTrafficCollector(api *APIPool, r *prometheus.Registry, gtmMetricsConfig GTMMetricsConfig, gtmMetricPrefix string, tstart time.Time, lookbackDuration time.Duration, opts PollOptions) *GTMDatacenterTrafficExporter {
+	d := &GTMDatacenterTrafficExporter{
 		GTMConfig:          gtmMetricsConfig,
+		DCMetricPrefix:     gtmMetricPrefix + "datacenter_traffic",
 		DCLookbackDuration: lookbackDuration,
-		AkamaiSession:      sess,
-		ctx:                ctx,
+		DCRegistry:         r,
+		api:                api,
+		opts:               opts,
+		cache:              newSampleCache(opts.CacheTTL),
 	}
-	gtmDatacenterTrafficExporter.DCMetricPrefix = gtmMetricPrefix + "datacenter_traffic"
-	gtmDatacenterTrafficExporter.DCLookbackDuration = lookbackDuration
-	gtmDatacenterTrafficExporter.DCRegistry = r
-
-	domainMap := make(map[string]map[int]time.Time)
 	for _, domain := range gtmMetricsConfig.Domains {
-		dcReqSummaryMap[domain.Name] = make(map[int]prometheus.Summary)
-		tStampMap := make(map[int]time.Time)
 		for _, dc := range domain.Datacenters {
-			tStampMap[dc.DatacenterID] = tstart
-
-			// Create and register Summaries
-			dcSumMap := createDatacenterMaps(domain.Name, dc.DatacenterID)
-			r.MustRegister(dcSumMap)
+			summary := prometheus.NewSummary(prometheus.SummaryOpts{
+				Namespace:   d.DCMetricPrefix,
+				Name:        "requests_per_interval_summary",
+				Help:        "Number of aggregate datacenter requests per 5 minute interval (per domain)",
+				MaxAge:      lookbackDuration,
+				BufCap:      prometheus.DefBufCap * 2,
+				ConstLabels: prometheus.Labels{"domain": domain.Name, "datacenter": strconv.Itoa(dc.DatacenterID)},
+			})
+			r.MustRegister(summary)
+			d.targets = append(d.targets, &dcTarget{domain: domain.Name, cfg: dc, summary: summary, last: tstart})
 		}
-		domainMap[domain.Name] = tStampMap
 	}
-	gtmDatacenterTrafficExporter.LastTimestamp = domainMap
-
-	return &gtmDatacenterTrafficExporter
-}
-
-// Summaries map by domain and datacenter
-var dcReqSummaryMap = make(map[string]map[int]prometheus.Summary)
-
-// Initialize locally maintained maps. Only use domain and datacenter.
-func createDatacenterMaps(domain string, dc int) prometheus.Summary {
-	dclabel := strconv.Itoa(dc)
-	labels := prometheus.Labels{"domain": domain, "datacenter": dclabel}
-
-	dcReqSummaryMap[domain][dc] = prometheus.NewSummary(
-		prometheus.SummaryOpts{
-			Namespace:   gtmDatacenterTrafficExporter.DCMetricPrefix,
-			Name:        "requests_per_interval_summary",
-			Help:        "Number of aggregate datacenter requests per 5 minute interval (per domain)",
-			MaxAge:      gtmDatacenterTrafficExporter.DCLookbackDuration,
-			BufCap:      prometheus.DefBufCap * 2,
-			ConstLabels: labels,
-		})
-
-	return dcReqSummaryMap[domain][dc]
+	return d
 }
 
 // Describe function
@@ -108,208 +92,116 @@ func (d *GTMDatacenterTrafficExporter) Describe(ch chan<- *prometheus.Desc) {
 	ch <- prometheus.NewDesc(d.DCMetricPrefix, "Akamai GTM Datacenter Traffic", nil, nil)
 }
 
-// Collect function
+// Collect serves the samples fetched by the background poller.
 func (d *GTMDatacenterTrafficExporter) Collect(ch chan<- prometheus.Metric) {
-	logrus.Debug("Entering GTM DC Traffic Collect")
-
-	endtime := time.Now().UTC() // Use same current time for all zones
-
-	// Collect metrics for each domain and datacenter
-	for _, domain := range d.GTMConfig.Domains {
-		logrus.Debugf("Processing domain %s", domain.Name)
-		for _, dc := range domain.Datacenters {
-			// get last timestamp recorded. make sure diff > 5 mins.
-			lasttime := d.LastTimestamp[domain.Name][dc.DatacenterID].Add(time.Minute)
-			if endtime.Before(lasttime.Add(time.Minute * 5)) {
-				lasttime = lasttime.Add(time.Minute * 5)
-			}
-
-			logrus.Debugf("Fetching datacenter Report for datacenter %d in domain %s.", dc.DatacenterID, domain.Name)
-			dcTrafficReport, err := d.retrieveDatacenterTraffic(domain.Name, dc.DatacenterID, lasttime, endtime)
-
-			if err != nil {
-				errStr := err.Error()
-				if strings.Contains(errStr, "500") {
-					logrus.Warnf("Unable to get traffic report for datacenter %d. Internal error ... Skipping.", dc.DatacenterID)
-					continue
-				}
-				if strings.Contains(errStr, "400") {
-					logrus.Warnf("Unable to get traffic report for datacenter %d. Skipping. Error: %s", dc.DatacenterID, errStr)
-					logrus.Errorf("%s", errStr)
-					continue
-				}
-				logrus.Errorf("Unable to get traffic report for datacenter %d ... Skipping. Error: %s", dc.DatacenterID, errStr)
-				continue
-			}
-			logrus.Debugf("Traffic Metadata: [%v]", dcTrafficReport.Metadata)
-			for _, reportInstance := range dcTrafficReport.DataRows {
-				instanceTimestamp, err := parseTimeString(reportInstance.Timestamp, GTMTrafficLongTimeFormat)
-				if err != nil {
-					logrus.Errorf("Instance timestamp invalid ... Skipping. Error: %s", err.Error())
-					continue
-				}
-
-				// Strict check against last processed timestamp
-				if !instanceTimestamp.After(d.LastTimestamp[domain.Name][dc.DatacenterID]) {
-					logrus.Debugf("Instance timestamp: [%v]. Last timestamp: [%v]", instanceTimestamp, d.LastTimestamp[domain.Name][dc.DatacenterID])
-					logrus.Warnf("Attempting to re process report instance: [%v]. Skipping.", reportInstance)
-					continue
-				}
-
-				// Missing interval warning
-				logrus.Debugf("Instance timestamp: [%v]. Last timestamp: [%v]", instanceTimestamp, d.LastTimestamp[domain.Name][dc.DatacenterID])
-				if instanceTimestamp.After(d.LastTimestamp[domain.Name][dc.DatacenterID].Add(time.Minute * (trafficReportInterval + 1))) {
-					logrus.Warnf("Missing report interval. Current: %v, Last: %v", instanceTimestamp, d.LastTimestamp[domain.Name][dc.DatacenterID])
-				}
-
-				var aggReqs int64
-				var baseLabels = []string{"domain", "datacenter"}
-
-				for _, instanceProp := range reportInstance.Properties {
-					aggReqs += instanceProp.Requests
-
-					if len(dc.Properties) > 0 {
-						if stringSliceContains(dc.Properties, instanceProp.Name) {
-							tsLabels := append(baseLabels, "property")
-							if d.GTMConfig.TSLabel {
-								tsLabels = append(tsLabels, "interval_timestamp")
-							}
-
-							ts := instanceTimestamp.Format(time.RFC3339)
-							desc := prometheus.NewDesc(prometheus.BuildFQName(d.DCMetricPrefix, "", "requests_per_interval"), "Number of datacenter requests per 5 minute interval (per domain)", tsLabels, nil)
-							logrus.Debugf("Creating Requests metric. Domain: %s, Datacenter: %d, Property: %s, Requests: %v, Timestamp: %v", domain.Name, dc.DatacenterID, instanceProp.Name, float64(instanceProp.Requests), ts)
-							var reqsmetric prometheus.Metric
-							if d.GTMConfig.TSLabel {
-								reqsmetric = prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, float64(instanceProp.Requests), domain.Name, strconv.Itoa(dc.DatacenterID), instanceProp.Name, ts)
-							} else {
-								reqsmetric = prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, float64(instanceProp.Requests), domain.Name, strconv.Itoa(dc.DatacenterID), instanceProp.Name)
-							}
-
-							if d.GTMConfig.UseTimestamp != nil && !*d.GTMConfig.UseTimestamp {
-								ch <- reqsmetric
-							} else {
-								ch <- prometheus.NewMetricWithTimestamp(instanceTimestamp, reqsmetric)
-							}
-						}
-					}
-				}
-
-				if len(dc.Properties) < 1 {
-					tsLabels := baseLabels
-					if d.GTMConfig.TSLabel {
-						tsLabels = append(tsLabels, "interval_timestamp")
-					}
-					ts := instanceTimestamp.Format(time.RFC3339)
-					desc := prometheus.NewDesc(prometheus.BuildFQName(d.DCMetricPrefix, "", "requests_per_interval"), "Number of datacenter requests per 5 minute interval (per domain)", tsLabels, nil)
-					logrus.Debugf("Creating Requests metric. Domain: %s, Datacenter: %d, Requests: %v, Timestamp: %v", domain.Name, dc.DatacenterID, float64(aggReqs), ts)
-					var reqsmetric prometheus.Metric
-					if d.GTMConfig.TSLabel {
-						reqsmetric = prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, float64(aggReqs), domain.Name, strconv.Itoa(dc.DatacenterID), ts)
-					} else {
-						reqsmetric = prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, float64(aggReqs), domain.Name, strconv.Itoa(dc.DatacenterID))
-					}
-
-					if d.GTMConfig.UseTimestamp != nil && !*d.GTMConfig.UseTimestamp {
-						ch <- reqsmetric
-					} else {
-						ch <- prometheus.NewMetricWithTimestamp(instanceTimestamp, reqsmetric)
-					}
-				}
-
-				dcReqSummaryMap[domain.Name][dc.DatacenterID].Observe(float64(aggReqs))
-
-				if instanceTimestamp.After(d.LastTimestamp[domain.Name][dc.DatacenterID]) {
-					logrus.Debugf("Updating Last Timestamp from %v TO %v", d.LastTimestamp[domain.Name][dc.DatacenterID], instanceTimestamp)
-					d.LastTimestamp[domain.Name][dc.DatacenterID] = instanceTimestamp
-				}
-				break // Only process one per interval
-			}
-		}
-	}
+	d.cache.collect(ch, time.Now())
 }
 
-func (d *GTMDatacenterTrafficExporter) retrieveDatacenterTraffic(domain string, dc int, start, end time.Time) (*DcTrafficResponse, error) {
-	// 1. Get Traffic Window
-	var apiWindow struct {
-		Start string `json:"start"`
-		End   string `json:"end"`
+// Start polls the reporting API in the background until ctx is done.
+func (d *GTMDatacenterTrafficExporter) Start(ctx context.Context) {
+	if len(d.targets) == 0 {
+		return
 	}
+	go pollLoop(ctx, datacenterCollectorName, d.opts.Interval, d.poll)
+}
 
-	windowPath := "/gtm-api/v1/reports/traffic/datacenters-window"
-	windowReq, _ := http.NewRequestWithContext(d.ctx, http.MethodGet, windowPath, nil)
-
-	// Use d.AkamaiSession.Exec.
-	// Note: If Exec returns the response, check for errors before parsing.
-	_, err := d.AkamaiSession.Exec(windowReq, &apiWindow)
+func (d *GTMDatacenterTrafficExporter) poll(ctx context.Context) error {
+	windowStart, windowEnd, err := fetchWindow(ctx, d.api.sessions[0], datacenterCollectorName, "/gtm-api/v1/reports/traffic/datacenters-window")
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch traffic window: %w", err)
+		return err
 	}
-
-	// Convert strings to time.Time to match old WindowResponse logic
-	startTime, err := time.Parse(time.RFC3339, apiWindow.Start)
-	if err != nil {
-		return nil, fmt.Errorf("invalid start time format from API (%s): %w", apiWindow.Start, err)
-	}
-	endTime, err := time.Parse(time.RFC3339, apiWindow.End)
-	if err != nil {
-		return nil, fmt.Errorf("invalid end time format from API (%s): %w", apiWindow.End, err)
-	}
-
-	// 2. Original Boundary Logic
-	qargs := make(map[string]string)
-
-	if startTime.Before(start) {
-		if endTime.After(start) {
-			qargs["start"], err = convertTimeFormat(start, time.RFC3339)
-		} else {
-			qargs["start"], err = convertTimeFormat(endTime, time.RFC3339)
+	now := time.Now().UTC()
+	windowEnd = settledWindowEnd(windowEnd, now, d.opts.SettleDelay)
+	var jobs []apiJob
+	for _, t := range d.targets {
+		if len(t.pending) > 0 {
+			d.processRow(t, t.pending[0].row, t.pending[0].ts)
+			t.pending = t.pending[1:]
+			continue
 		}
-	} else {
-		qargs["start"], err = convertTimeFormat(startTime, time.RFC3339)
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	if endTime.Before(end) {
-		qargs["end"], err = convertTimeFormat(endTime, time.RFC3339)
-	} else {
-		qargs["end"], err = convertTimeFormat(end, time.RFC3339)
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	// Window validation check
-	if qargs["start"] >= qargs["end"] {
-		logrus.Warnf("Start or End time outside valid report window")
-		return &DcTrafficResponse{DataRows: []*DatacenterTrafficData{}}, nil
-	}
-
-	// 3. Fetch Traffic Data
-	path := fmt.Sprintf("/gtm-api/v1/reports/traffic/domains/%s/datacenters/%d", domain, dc)
-	req, _ := http.NewRequestWithContext(d.ctx, http.MethodGet, path, nil)
-
-	q := req.URL.Query()
-	q.Add("start", qargs["start"])
-	q.Add("end", qargs["end"])
-	req.URL.RawQuery = q.Encode()
-
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-	var result DcTrafficResponse
-	resp, err := d.AkamaiSession.Exec(req, &result)
-	if err != nil {
-		if resp != nil && resp.StatusCode == http.StatusNotFound {
-			return nil, fmt.Errorf("datacenter %d not found in domain %s", dc, domain)
+		if !windowEnd.After(t.fetchedThrough) {
+			continue
 		}
-		return nil, err
+		start, end, ok := trafficQueryRange(t.last, windowStart, windowEnd, now)
+		if !ok {
+			logrus.Debugf("No new report for datacenter %d in domain %s yet", t.cfg.DatacenterID, t.domain)
+			continue
+		}
+		t := t
+		jobs = append(jobs, func(ctx context.Context, sess session.Session) {
+			d.pollTarget(ctx, sess, t, start, end, windowEnd)
+		})
+	}
+	d.api.run(ctx, jobs)
+	return nil
+}
+
+func (d *GTMDatacenterTrafficExporter) pollTarget(ctx context.Context, sess session.Session, t *dcTarget, start, end, windowEnd time.Time) {
+	query := url.Values{}
+	query.Set("start", start.UTC().Format(time.RFC3339))
+	query.Set("end", end.UTC().Format(time.RFC3339))
+	path := fmt.Sprintf("/gtm-api/v1/reports/traffic/domains/%s/datacenters/%d", t.domain, t.cfg.DatacenterID)
+
+	var report DcTrafficResponse
+	if err := getJSON(ctx, sess, datacenterCollectorName, "report", path, query, &report); err != nil {
+		logrus.Warnf("Unable to get traffic report for datacenter %d in domain %s ... Skipping. Error: %s", t.cfg.DatacenterID, t.domain, err)
+		return
+	}
+	sortDCDataRowsByTimestamp(report.DataRows)
+
+	t.fetchedThrough = windowEnd
+	var pending []pendingRow[*DatacenterTrafficData]
+	for _, row := range report.DataRows {
+		ts, err := parseTimeString(row.Timestamp, GTMTrafficLongTimeFormat)
+		if err != nil {
+			logrus.Errorf("Instance timestamp invalid ... Skipping. Error: %s", err)
+			continue
+		}
+		if ts.After(t.last) && settled(ts, windowEnd, d.opts.SettleDelay) {
+			pending = append(pending, pendingRow[*DatacenterTrafficData]{row: row, ts: ts})
+		}
+	}
+	if len(pending) == 0 {
+		// Without it a target with no traffic queries an ever growing range.
+		t.last = emptyReportCursor(t.last, end)
+		return
+	}
+	// One row per cycle, as the scrape-time collector did: one exposition
+	// cannot hold two samples of the same series. The rest is queued.
+	d.processRow(t, pending[0].row, pending[0].ts)
+	t.pending = pending[1:]
+}
+
+func (d *GTMDatacenterTrafficExporter) processRow(t *dcTarget, row *DatacenterTrafficData, ts time.Time) {
+	if ts.After(t.last.Add(time.Minute * (trafficReportInterval + 1))) {
+		logrus.Warnf("Missing report interval. Current: %v, Last: %v", ts, t.last)
+	}
+	now := time.Now()
+	name := prometheus.BuildFQName(d.DCMetricPrefix, "", "requests_per_interval")
+	help := "Number of datacenter requests per 5 minute interval (per domain)"
+	tsLabel := ts.Format(time.RFC3339)
+	dcID := strconv.Itoa(t.cfg.DatacenterID)
+
+	emit := func(labelNames, labelValues []string, value float64) {
+		if d.GTMConfig.TSLabel {
+			labelNames = append(labelNames, "interval_timestamp")
+			labelValues = append(labelValues, tsLabel)
+		}
+		desc := prometheus.NewDesc(name, help, labelNames, nil)
+		m := prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, value, labelValues...)
+		d.cache.put(seriesKey(name, labelValues...), withReportTimestamp(d.GTMConfig, ts, m), now)
 	}
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status: %d", resp.StatusCode)
+	var aggReqs int64
+	for _, prop := range row.Properties {
+		aggReqs += prop.Requests
+		if len(t.cfg.Properties) > 0 && stringSliceContains(t.cfg.Properties, prop.Name) {
+			emit([]string{"domain", "datacenter", "property"}, []string{t.domain, dcID, prop.Name}, float64(prop.Requests))
+		}
 	}
-
-	sortDCDataRowsByTimestamp(result.DataRows)
-	return &result, nil
+	if len(t.cfg.Properties) < 1 {
+		emit([]string{"domain", "datacenter"}, []string{t.domain, dcID}, float64(aggReqs))
+	}
+	t.summary.Observe(float64(aggReqs))
+	t.last = ts
 }
